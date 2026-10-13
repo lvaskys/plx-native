@@ -47,6 +47,11 @@ any in-flight Load immediately; continue pumping while idle to reap it. Keep
 native/CDM resources alive until that retirement finishes. App generations
 cannot be reused within a PlayerAdapter lifetime. This prototype has no seek,
 source networking or full-stream API; it does not change Plex's completion gate.
+The app duration ceiling is now 60 seconds for a bounded replenishment test.
+The embedding source owns incremental encrypted input; this Engine still owns
+AU admission, Feed pacing, native stages and EOS. Temporary source starvation
+must not publish lane EOF. This extension does not accept full-episode playback,
+provider renewal or seeking.
 Feed may preroll after Load returns; app-source Play additionally waits for the
 real epoch-guarded loadCompleted callback. An empty-queue pump tick retries the
 prime after completion. A native Play acknowledgement alone is not proof of a

@@ -258,6 +258,20 @@ fn invalid_configuration_and_overlapping_start_leave_the_live_owner_intact() {
 }
 
 #[test]
+fn bounded_replenishment_accepts_sixty_seconds_and_refuses_larger_duration() {
+    let _g = plx_base::testlock::serial(); let mut pa=fresh();
+    for duration in [0, -1, 60_000_000_001, i64::MAX] {
+        let mut bad=config(1); bad.duration_ns=duration;
+        assert!(matches!(start_app_source(&mut pa,bad),Err(AppSourceError::Invalid)));
+        assert!(pa.engine().is_none());
+    }
+    let mut bounded=config(1); bounded.duration_ns=60_000_000_000;
+    start_app_source(&mut pa,bounded).unwrap(); ready(&mut pa);
+    assert_eq!(SHARED.duration_ns.load(Ordering::Relaxed),60_000_000_000);
+    assert!(stop_app_source(&mut pa,1)); ffi_host::force_clocksink_for_test(false);
+}
+
+#[test]
 fn accepted_load_can_feed_preroll_without_a_loadcompleted_callback_and_preserves_svp() {
     let _g = plx_base::testlock::serial(); let mut pa=fresh();
     ffi_host::suppress_app_completed_for_test(true);

@@ -6,7 +6,7 @@ use std::os::raw::c_void;
 use std::sync::atomic::{AtomicI32, AtomicU32};
 
 /// Prototype limit: caller supplies validated H264/AAC/SVP Load facts and
-/// already prepared output. Duration is capped to the accepted 30-second probe.
+/// already prepared output. Duration is capped to the bounded 60-second streaming test.
 /// This is not the eventual streaming-source API or validation of a DASH URL.
 pub struct AppSourceStart {
     pub generation: u64,
@@ -118,7 +118,7 @@ pub fn app_source_native_event(epoch: u32, ty: c_int, num: i64) {
 /// as the Plex path. The app owns the selected source and all provider effects.
 pub fn start_app_source(pa: &mut super::super::adapter::PlayerAdapter, start: AppSourceStart)
     -> Result<u32, AppSourceError> {
-    if start.generation == 0 || !(1..=30_000_000_000).contains(&start.duration_ns)
+    if start.generation == 0 || !(1..=60_000_000_000).contains(&start.duration_ns)
         || !(1..=4096).contains(&start.raster.0) || !(1..=2160).contains(&start.raster.1)
         || start.payload.to_str().is_err() || start.payload.as_bytes().len() > 16_384 {
         return Err(AppSourceError::Invalid);
