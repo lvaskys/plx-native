@@ -47,7 +47,7 @@ any in-flight Load immediately; continue pumping while idle to reap it. Keep
 native/CDM resources alive until that retirement finishes. App generations
 cannot be reused within a PlayerAdapter lifetime. This prototype has no seek,
 source networking or full-stream API; it does not change Plex's completion gate.
-The app duration ceiling is now 60 seconds for a bounded replenishment test.
+The app duration ceiling is now 360 seconds for a bounded renewal test.
 The embedding source owns incremental encrypted input; this Engine still owns
 AU admission, Feed pacing, native stages and EOS. Temporary source starvation
 must not publish lane EOF. This extension does not accept full-episode playback,
