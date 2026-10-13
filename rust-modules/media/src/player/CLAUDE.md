@@ -28,6 +28,25 @@ so the AVIO is not merely how bytes reach it today, it is the only way they *can
 emits Annex-B video AUs (param sets prepended at each keyframe) and, for AV1, Section-5 temporal units (TD OBU first, the av1C sequence header and metadata OBUs in-band on keyframes; `/tmp/plxnative-av1obu` = notd,noseq,raw tokens varies it on a debug build), for VP9 the demuxed packet unchanged (a frame carries its own headers and libpf's `video/x-vp9` caps have no `codec_data`), and AC3/EAC3, ADTS-framed AAC, or DTS core audio frames,
 and seeks by time via `av_seek_frame` (libavformat's own Cues index).
 
+## Local fork: prepared app-owned source
+
+This fork also exposes the bounded `engine::start_app_source` / enqueue / EOF /
+pump / Stop entry in `app_source.rs`. It constructs the same Engine with no
+Plex route attempt or reporter. Plex and app sources share native stages,
+queues, feed/prime and native teardown; ordinary copied-byte AUs remain supported.
+App-owned queue nodes retain an original output pointer and release callback.
+Admission and every disposal stay on the SDL thread; only successful enqueue
+transfers ownership. These contracts are exercised by `app_source_tests.rs`
+with the host sink, not hardware DRM. The embedding application's CENC/CDM source
+and LG sink integration remain separate work.
+
+App preroll uses an explicit Load-returned readiness policy, preserving the
+caller's appId/SVP facts. It does not manufacture loadCompleted. App Stop parks
+any in-flight Load immediately; continue pumping while idle to reap it. Keep
+native/CDM resources alive until that retirement finishes. App generations
+cannot be reused within a PlayerAdapter lifetime. This prototype has no seek,
+source networking or full-stream API; it does not change Plex's completion gate.
+
 ## Threading model (this is the whole ballgame)
 
 - `engine.rs` — the **main-thread-confined** session object. All ACB/Starfish *control* calls happen
@@ -124,7 +143,8 @@ something.
   epoch are parked as `engine::AbandonedLoad` (Rust phase `Abandoned`), native starts are
   refused, and `reap_abandoned_load` runs the ordinary Unload → gate → retire → D1 release on the
   main thread once Load returns; a Load that never returns leaks its object. A Load that has not
-  timed out is still joined. The host concurrent tests model this boundary, not
+  timed out is still joined on the Plex path; app-source Stop parks it immediately.
+  The host concurrent tests model this boundary, not
   the firmware's native initialization. ACB dispatch is additionally constrained by stage/bind
   ordering; the C Starfish gate does not wrap ACB calls.
 - **A flight HOLDS presentation for its worker's run (`claim_hold.rs`; the flight itself is

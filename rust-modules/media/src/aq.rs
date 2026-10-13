@@ -12,6 +12,9 @@ pub struct AuNode {
     pts: i64,
     len: c_int,
     key: c_int,
+    owned_data: *const u8,
+    owner: *mut c_void,
+    release: Option<unsafe extern "C" fn(*mut c_void)>,
     es: c_int,
     // flexible array `data[]` follows immediately after `es` (see node_data)
 }
@@ -61,7 +64,7 @@ pub unsafe fn au_fields(n: *mut AuNode) -> (c_int, c_int, i64, c_int, *const u8)
         (*n).key,
         (*n).pts,
         (*n).len,
-        node_data(n) as *const u8,
+        if (*n).owned_data.is_null() { node_data(n) as *const u8 } else { (*n).owned_data },
     )
 }
 
@@ -219,6 +222,9 @@ fn aq_push_park(
         if n.is_null() {
             return -1;
         }
+        (*n).owned_data = ptr::null();
+        (*n).owner = ptr::null_mut();
+        (*n).release = None;
         (*n).next = ptr::null_mut();
         (*n).pts = pts;
         (*n).len = len;
@@ -273,6 +279,49 @@ fn aq_push_park(
     }
 }
 
+/// Consumer disposal for both copied nodes and externally owned output.
+/// # Safety
+/// A live popped node, disposed exactly once. Externally owned nodes must be
+/// disposed on their owning thread; release must not unwind or reenter the queue.
+pub unsafe fn au_free(n: *mut AuNode) {
+    if n.is_null() { return; }
+    if let Some(release) = (*n).release { release((*n).owner); }
+    libc::free(n.cast());
+}
+
+/// Nonblocking admission for an app-owned queue, with strict byte accounting.
+/// Returns 0/accepted, 1/full, -1/invalid-or-closed. Only 0 transfers ownership.
+/// # Safety
+/// Queue operations and every release of these nodes must stay on the owner's
+/// thread. No worker may clear/pop this queue. data and owner remain live until
+/// release; callbacks must not unwind/reenter. A protected payload stays opaque.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn aq_try_push_owned(q: *mut AuQueue, data: *const u8, len: c_int,
+    pts: i64, key: c_int, es: c_int, owner: *mut c_void,
+    release: Option<unsafe extern "C" fn(*mut c_void)>) -> c_int {
+    if q.is_null() || data.is_null() || owner.is_null() || release.is_none()
+        || len <= 0 || pts < 0 || !(1..=2).contains(&es) { return -1; }
+    libc::pthread_mutex_lock(ptr::addr_of_mut!((*q).m));
+    let result = if (*q).abort != 0 || (*q).eof != 0 || c_long::from(len) > (*q).max_bytes {
+        -1
+    } else if (*q).queued_bytes > (*q).max_bytes - c_long::from(len) {
+        1
+    } else {
+        let n = libc::malloc(core::mem::size_of::<AuNode>()).cast::<AuNode>();
+        if n.is_null() { -1 } else {
+            ptr::write(n, AuNode { next: ptr::null_mut(), pts, len, key, es,
+                owned_data: data, owner, release });
+            if (*q).tail.is_null() { (*q).head = n; } else { (*(*q).tail).next = n; }
+            (*q).tail = n;
+            (*q).queued_bytes += c_long::from(len);
+            libc::pthread_cond_signal(ptr::addr_of_mut!((*q).not_empty));
+            0
+        }
+    };
+    libc::pthread_mutex_unlock(ptr::addr_of_mut!((*q).m));
+    result
+}
+
 /// Consumer: pop the next AU (caller frees it) or NULL. Never blocks.
 /// *eof_out = 1 when the producer finished and the queue is drained.
 pub fn aq_pop(q: *mut AuQueue, eof_out: *mut c_int) -> *mut AuNode {
@@ -299,6 +348,18 @@ pub fn aq_pop(q: *mut AuQueue, eof_out: *mut c_int) -> *mut AuNode {
         }
         libc::pthread_mutex_unlock(ptr::addr_of_mut!((*q).m));
         n
+    }
+}
+
+/// An EOF-marked queue with no queued nodes. Pending output is the consumer's
+/// separate responsibility. The same mutex linearizes producer publication.
+pub fn aq_drained_eof(q: *mut AuQueue) -> bool {
+    if q.is_null() { return false; }
+    unsafe {
+        libc::pthread_mutex_lock(ptr::addr_of_mut!((*q).m));
+        let drained = (*q).head.is_null() && (*q).eof != 0;
+        libc::pthread_mutex_unlock(ptr::addr_of_mut!((*q).m));
+        drained
     }
 }
 
@@ -449,7 +510,7 @@ mod tests {
         );
         let n = aq_pop(&mut *q, ptr::null_mut());
         assert!(!n.is_null());
-        unsafe { libc::free(n as *mut c_void) };
+        unsafe { au_free(n) };
         assert_eq!(worker.join().unwrap(), 0);
         aq_destroy(&mut *q);
     }
@@ -522,8 +583,71 @@ mod tests {
         );
         let n = aq_pop(&mut *q, ptr::null_mut());
         assert!(!n.is_null());
-        unsafe { libc::free(n as *mut c_void) };
+        unsafe { au_free(n) };
         assert_eq!(worker.join().unwrap(), 0);
+        aq_destroy(&mut *q);
+    }
+}
+
+#[cfg(test)]
+mod owned_queue_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    struct Owner { bytes: Vec<u8>, releases: Rc<Cell<u32>> }
+    unsafe extern "C" fn release(p: *mut c_void) {
+        let owner = Box::from_raw(p.cast::<Owner>());
+        owner.releases.set(owner.releases.get() + 1);
+    }
+    fn owner(count: &Rc<Cell<u32>>, size: usize) -> (*mut c_void, *const u8) {
+        let value = Box::new(Owner { bytes: vec![0xa5; size], releases: count.clone() });
+        let data = value.bytes.as_ptr();
+        (Box::into_raw(value).cast(), data)
+    }
+    #[test]
+    fn owned_output_keeps_original_address_and_releases_once() {
+        let count = Rc::new(Cell::new(0));
+        let (owner, data) = owner(&count, 5);
+        let mut q = aq_new(8);
+        assert_eq!(unsafe { aq_try_push_owned(&mut *q, data, 5, 33, 1, 1, owner, Some(release)) }, 0);
+        assert_eq!(aq_bytes(&mut *q), 5);
+        let n = aq_pop(&mut *q, ptr::null_mut());
+        assert_eq!(unsafe { au_fields(n) }, (1, 1, 33, 5, data));
+        assert_eq!(count.get(), 0);
+        unsafe { au_free(n); }
+        assert_eq!(count.get(), 1);
+        aq_destroy(&mut *q);
+    }
+    #[test]
+    fn cap_abort_eof_and_invalid_arguments_do_not_transfer_ownership() {
+        let count = Rc::new(Cell::new(0));
+        let (first, data) = owner(&count, 5);
+        let (next, next_data) = owner(&count, 5);
+        let mut q = aq_new(8);
+        assert_eq!(unsafe { aq_try_push_owned(&mut *q, data, 5, 0, 1, 1, first, Some(release)) }, 0);
+        assert_eq!(unsafe { aq_try_push_owned(&mut *q, next_data, 5, 0, 1, 1, next, Some(release)) }, 1);
+        assert_eq!(count.get(), 0);
+        assert_eq!(unsafe { aq_try_push_owned(&mut *q, next_data, 5, -1, 1, 1, next, Some(release)) }, -1);
+        aq_set_eof(&mut *q);
+        assert_eq!(unsafe { aq_try_push_owned(&mut *q, next_data, 1, 0, 1, 1, next, Some(release)) }, -1);
+        aq_abort(&mut *q);
+        assert_eq!(unsafe { aq_try_push_owned(&mut *q, next_data, 1, 0, 1, 1, next, Some(release)) }, -1);
+        let n = aq_pop(&mut *q, ptr::null_mut());
+        unsafe { au_free(n); release(next); }
+        assert_eq!(count.get(), 2);
+        aq_destroy(&mut *q);
+    }
+    #[test]
+    fn ordinary_copied_nodes_keep_their_existing_fields_and_storage() {
+        let mut q = aq_new(16);
+        let input = [1, 2, 3, 4];
+        assert_eq!(aq_push(&mut *q, input.as_ptr(), 4, 9, 0, 2), 0);
+        let n = aq_pop(&mut *q, ptr::null_mut());
+        let (es, key, pts, len, data) = unsafe { au_fields(n) };
+        assert_eq!((es,key,pts,len), (2,0,9,4));
+        assert_ne!(data, input.as_ptr());
+        assert_eq!(unsafe { std::slice::from_raw_parts(data, 4) }, input);
+        unsafe { au_free(n); }
         aq_destroy(&mut *q);
     }
 }

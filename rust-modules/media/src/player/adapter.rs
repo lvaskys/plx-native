@@ -34,6 +34,8 @@ pub struct PlayerAdapter {
     mt: MainThread,
     /// The live native session, or `None` between playbacks.
     engine: Option<Engine>,
+    /// Never reuse an app source generation within this adapter lifetime.
+    app_generation: u64,
     repair: Option<(u64, std::sync::mpsc::Receiver<Result<(), plx_platform::tv::sandbox::Failure>>)>,
     /// A timed-out native `Load` whose media thread had not returned when its Engine was torn
     /// down. Owned here, not by a static, for the same reason the Engine is: releasing it calls
@@ -47,9 +49,16 @@ impl PlayerAdapter {
         Self {
             mt,
             engine: None,
+            app_generation: 0,
             repair: None,
             abandoned_load: None,
         }
+    }
+
+    pub(super) fn admit_app_generation(&mut self, generation: u64) -> bool {
+        if generation == 0 || generation <= self.app_generation { return false; }
+        self.app_generation = generation;
+        true
     }
 
     /// UI-thread resource effect. The owner spends the attempt before the worker can run.

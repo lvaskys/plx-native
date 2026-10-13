@@ -371,6 +371,8 @@ pub(super) fn reset_native_lifecycle_for_test() {
     *HOLD_LOAD.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
     HOLD_LOAD.1.notify_all();
     Clock::rewind();
+    *OWNED_FEED_TEST.lock().unwrap() = None;
+    SUPPRESS_APP_COMPLETED.store(false, Relaxed);
 }
 
 /// Start the sink clock running at `base_ns` in the fed-PTS space with plenty of fed media ahead,
@@ -520,6 +522,13 @@ unsafe fn sf_load(payload: *const c_char, epoch: u32) -> c_int {
     // through the real callback rather than setting the flag, so the parse is exercised. Type 2 is
     // benign: the harness greps `smp_cb type=18` for a playback error and this is not one.
     CALLBACK_INTERCEPTS.fetch_add(1, Relaxed);
+    #[cfg(test)]
+    if SUPPRESS_APP_COMPLETED.load(Relaxed) {
+        super::sf_on_event(epoch, 99, 0, std::ptr::null());
+    } else {
+    super::sf_on_event(epoch, 2, 0, c"{\"loadCompleted\":true}".as_ptr());
+    }
+    #[cfg(not(test))]
     super::sf_on_event(epoch, 2, 0, c"{\"loadCompleted\":true}".as_ptr());
     // issue #74 D.1 test seam: on the real (v0.6.0) seam this is the exact window between
     // `SMP_SET_READY(1)` and the real, blocking Load call returning — `loadCompleted` has
@@ -654,11 +663,38 @@ unsafe fn sf_send_segment() -> c_int {
 /// buffer to fill — the app's backpressure is upstream, in the AU queues' byte caps and the
 /// feed-ahead throttle, and those are exactly what this exists to exercise. Returning `'B'` here
 /// would add a second, fictional one.
+#[cfg(test)]
+static SUPPRESS_APP_COMPLETED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(super) fn suppress_app_completed_for_test(on: bool) {
+    SUPPRESS_APP_COMPLETED.store(on, Relaxed);
+}
+#[cfg(test)]
+type OwnedFeedCall = (usize, u32, i64, c_int);
+#[cfg(test)]
+static OWNED_FEED_TEST: Mutex<Option<(std::collections::VecDeque<u8>, Vec<OwnedFeedCall>)>> = Mutex::new(None);
+#[cfg(test)]
+pub(super) fn owned_feed_script_for_test(script: Vec<u8>) {
+    *OWNED_FEED_TEST.lock().unwrap() = Some((script.into(), Vec::new()));
+}
+#[cfg(test)]
+pub(super) fn take_owned_feeds_for_test() -> Vec<OwnedFeedCall> {
+    OWNED_FEED_TEST.lock().unwrap().take().unwrap().1
+}
+
 unsafe fn sf_feed(p: *const u8, size: c_uint, pts: i64, es_data: c_int) -> c_char {
     #[cfg(any(test, feature = "test-support"))]
     note_dispatch("sf_feed");
     if !enabled() {
         return FEED_ERROR;
+    }
+    #[cfg(test)]
+    if let Some((script, calls)) = OWNED_FEED_TEST.lock().unwrap().as_mut() {
+        calls.push((p as usize,size,pts,es_data));
+        let reply = script.pop_front().unwrap_or(b'O');
+        if reply == b'O' && es_data == 1 { FED_MAX_NS.fetch_max(pts, Relaxed); }
+        // Synthetic owned-output fixture: never inspect opaque bytes.
+        return reply as c_char;
     }
     if es_data == 1 {
         FED_MAX_NS.fetch_max(pts, Relaxed);
