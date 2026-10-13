@@ -37,6 +37,9 @@ unsigned int sf_callback_intercepts(void); /* runtime evidence counter for the c
 int  sf_destroy(void);
 /* Keep the current constructed object forever and permanently reject another Load. */
 void sf_quarantine(void);
+/* No constructed native object remains. Caller must also join/reap Load before
+ * releasing a separately owned CDM/provider. Quarantine is not cleanup. */
+int sf_cleanup_complete(void);
 
 /* ---- the video-plane binding: decoded sink -> display plane ----
  *

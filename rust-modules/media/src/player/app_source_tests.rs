@@ -6,6 +6,26 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use super::super::ffi_host;
 struct Owner { bytes: Vec<u8>, released: Rc<Cell<u32>> }
+#[test]
+fn numeric_app_events_are_epoch_guarded_and_fail_on_midplay_error() {
+    let _g=plx_base::testlock::serial();let mut pa=fresh();
+    let first=start_app_source(&mut pa,config(1)).unwrap();ready(&mut pa);
+    app_source_native_event(first,22,0);app_source_native_event(first,7,i64::MAX);
+    app_source_native_event(first,43,i64::MAX);app_source_native_event(first,0,400_000_000);
+    let m=app_source_metrics();assert_eq!(m.position_ns,400_000_000);
+    assert_eq!((m.audio_info,m.svp_events,m.error_type),(1,1,0));
+    assert!(m.load_completed_ms>=0 && m.first_picture_ms>=0);
+    app_source_native_event(first,9000,i64::MAX);app_source_native_event(first,0,-1);
+    assert_eq!(app_source_metrics().position_ns,400_000_000);
+    assert!(stop_app_source(&mut pa,1));
+    let next=start_app_source(&mut pa,config(2)).unwrap();ready(&mut pa);
+    for ty in [7,43,18,28] { app_source_native_event(first,ty,101); }
+    let m=app_source_metrics();assert_eq!((m.audio_info,m.svp_events,m.error_type,m.eos),(0,0,0,0));
+    app_source_native_event(next,0,1_000_000_000);app_source_native_event(next,19,101);
+    assert_eq!(pump_app_source(&mut pa,super::super::vclock_ms()),AppSourceStatus::Failed);
+    assert_eq!(app_source_metrics().error_number,101);
+    assert!(stop_app_source(&mut pa,2));ffi_host::force_clocksink_for_test(false);
+}
 unsafe extern "C" fn release(p: *mut c_void) {
     let o = Box::from_raw(p.cast::<Owner>());
     o.released.set(o.released.get()+1);
@@ -201,8 +221,24 @@ fn accepted_load_can_feed_preroll_without_a_loadcompleted_callback_and_preserves
     assert_eq!(payload.pointer("/args/0/option/appId").unwrap(),"com.linas.nativeaccountprobe");
     let count=Rc::new(Cell::new(0)); enqueue(&mut pa,1,1,700_000_000,&count); enqueue(&mut pa,1,2,400_000_000,&count);
     ffi_host::owned_feed_script_for_test(vec![b'O',b'O']);
+    let plays=ffi_host::play_calls_for_test();
     pump_app_source(&mut pa,super::super::vclock_ms()); assert_eq!(count.get(),2);
     ffi_host::take_owned_feeds_for_test();
+    // Preroll may Feed after Load returns, but a native acknowledgement before
+    // loadCompleted is not clock activation. Keep the prime held until the
+    // actual callback, then retry from an empty-queue tick without new source AUs.
+    assert_eq!(ffi_host::play_calls_for_test(),plays);
+    assert!(pa.engine().unwrap().prime_play);
+    assert_eq!(app_source_metrics().play_attempts,0);
+    app_source_native_event(pa.engine().unwrap().native_epoch,22,0);
+    pump_app_source(&mut pa,super::super::vclock_ms());
+    assert_eq!(ffi_host::play_calls_for_test(),plays+1);
+    assert!(!pa.engine().unwrap().prime_play);
+    let m=app_source_metrics();
+    assert_eq!((m.play_attempts,m.play_acknowledged),(1,1));
+    assert!(m.first_play_ms>=m.load_completed_ms);
+    pump_app_source(&mut pa,super::super::vclock_ms());
+    assert_eq!(ffi_host::play_calls_for_test(),plays+1);
     assert!(stop_app_source(&mut pa,1)); ffi_host::force_clocksink_for_test(false);
 }
 

@@ -3,6 +3,7 @@
 use super::*;
 use std::ffi::CString;
 use std::os::raw::c_void;
+use std::sync::atomic::{AtomicI32, AtomicU32};
 
 /// Prototype limit: caller supplies validated H264/AAC/SVP Load facts and
 /// already prepared output. Duration is capped to the accepted 30-second probe.
@@ -19,6 +20,99 @@ pub enum AppSourceError { Invalid, Busy, NativeBusy, StartFailed }
 pub enum AppEnqueue { Accepted, Full, Invalid, Stale }
 #[derive(Debug, PartialEq, Eq)]
 pub enum AppSourceStatus { Idle, Loading, Buffering, Playing, Ended, Failed }
+
+static APP_STARTED: AtomicU32 = AtomicU32::new(0);
+static APP_FIRST_PICTURE: AtomicI64 = AtomicI64::new(-1);
+static APP_LOAD_COMPLETED: AtomicI64 = AtomicI64::new(-1);
+static APP_AUDIO_INFO: AtomicU32 = AtomicU32::new(0);
+static APP_SVP: AtomicU32 = AtomicU32::new(0);
+static APP_ERROR_TYPE: AtomicI32 = AtomicI32::new(0);
+static APP_ERROR_NUMBER: AtomicI64 = AtomicI64::new(0);
+static APP_PLAY_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+static APP_PLAY_ACKNOWLEDGED: AtomicU32 = AtomicU32::new(0);
+static APP_FIRST_PLAY: AtomicI64 = AtomicI64::new(-1);
+static APP_LAST_PLAY: AtomicI64 = AtomicI64::new(-1);
+
+// Called after the main-thread native Play attempt. Acknowledgement is a native
+// return value, not proof of clock activation or presentation. No behavior changes.
+pub(super) fn note_app_play(acknowledged: bool) {
+    APP_PLAY_ATTEMPTS.fetch_add(1,Ordering::AcqRel);
+    if acknowledged { APP_PLAY_ACKNOWLEDGED.fetch_add(1,Ordering::AcqRel); }
+    let elapsed=i64::from(super::super::vclock_ms().wrapping_sub(APP_STARTED.load(Ordering::Acquire)));
+    let _=APP_FIRST_PLAY.compare_exchange(-1,elapsed,Ordering::AcqRel,Ordering::Acquire);
+    APP_LAST_PLAY.store(elapsed,Ordering::Release);
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AppSourceMetrics {
+    pub position_ns: i64,
+    pub frames: i32,
+    pub audio_info: u32,
+    pub svp_events: u32,
+    pub first_picture_ms: i64,
+    pub load_completed_ms: i64,
+    pub eos: i32,
+    pub error_type: i32,
+    pub error_number: i64,
+    pub video_accepted: i64,
+    pub audio_accepted: i64,
+    pub play_attempts: u32,
+    pub play_acknowledged: u32,
+    pub first_play_ms: i64,
+    pub last_play_ms: i64,
+}
+/// Main-thread readout. These counters prove numeric progress, never pixels or
+/// audible audio; the hardware gate still requires the viewer's observation.
+pub fn app_source_metrics() -> AppSourceMetrics {
+    AppSourceMetrics { position_ns: SHARED.playpos_ns.load(Ordering::Acquire),
+        frames: SHARED.frames.load(Ordering::Acquire), audio_info: APP_AUDIO_INFO.load(Ordering::Acquire),
+        svp_events: APP_SVP.load(Ordering::Acquire), first_picture_ms: APP_FIRST_PICTURE.load(Ordering::Acquire),
+        load_completed_ms: APP_LOAD_COMPLETED.load(Ordering::Acquire),
+        eos: i32::from(SHARED.ended.load(Ordering::Acquire)), error_type: APP_ERROR_TYPE.load(Ordering::Acquire),
+        error_number: APP_ERROR_NUMBER.load(Ordering::Acquire),
+        video_accepted: VTOT.load(Ordering::Acquire), audio_accepted: ATOT.load(Ordering::Acquire),
+        play_attempts: APP_PLAY_ATTEMPTS.load(Ordering::Acquire),
+        play_acknowledged: APP_PLAY_ACKNOWLEDGED.load(Ordering::Acquire),
+        first_play_ms: APP_FIRST_PLAY.load(Ordering::Acquire), last_play_ms: APP_LAST_PLAY.load(Ordering::Acquire) }
+}
+
+/// Narrow callback ingress for the bounded app source. Unlike the Plex callback,
+/// this accepts no text, source-info envelope, media identity or protected handle.
+/// Numbers above EOS are firmware-dependent and deliberately ignored. The epoch
+/// mutex covers the entire publication, including retirement during Unload.
+pub fn app_source_native_event(epoch: u32, ty: c_int, num: i64) {
+    if !matches!(ty, 0 | 7 | 18 | 19 | 22 | 23 | 28 | 43) || (ty == 0 && num < 0) { return; }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let class = match ty {
+            0 => super::super::shared::NativeEventClass::Presentation,
+            23 => super::super::shared::NativeEventClass::UnloadCompleted,
+            _ => super::super::shared::NativeEventClass::Other,
+        };
+        SHARED.with_native_session(epoch, class, num, || match ty {
+            0 => {
+                super::super::sf_on_event_inner(0, num, std::ptr::null());
+                let elapsed = i64::from(super::super::vclock_ms().wrapping_sub(APP_STARTED.load(Ordering::Acquire)));
+                let _ = APP_FIRST_PICTURE.compare_exchange(-1,elapsed,Ordering::AcqRel,Ordering::Acquire);
+            },
+            7 => { APP_AUDIO_INFO.fetch_add(1,Ordering::AcqRel); },
+            43 => { APP_SVP.fetch_add(1,Ordering::AcqRel); }, // count only; num may be a protected handle
+            22 => {
+                SHARED.load_completed.store(true, Ordering::Release);
+                let elapsed = i64::from(super::super::vclock_ms().wrapping_sub(APP_STARTED.load(Ordering::Acquire)));
+                let _ = APP_LOAD_COMPLETED.compare_exchange(-1,elapsed,Ordering::AcqRel,Ordering::Acquire);
+            },
+            28 => { SHARED.ended.store(true, Ordering::Release); },
+            18 | 19 => {
+                if APP_ERROR_TYPE.compare_exchange(0,ty,Ordering::AcqRel,Ordering::Acquire).is_ok() {
+                    APP_ERROR_NUMBER.store(num,Ordering::Release);
+                }
+                SHARED.demux_io_failed.store(true, Ordering::Release);
+            },
+            _ => {},
+        });
+    }));
+}
 
 /// Uses the same native clock/start guards, Load worker and Engine initializer
 /// as the Plex path. The app owns the selected source and all provider effects.
@@ -54,6 +148,12 @@ pub fn start_app_source(pa: &mut super::super::adapter::PlayerAdapter, start: Ap
     let native = NativeSessionStartGuard::arm().ok_or(AppSourceError::NativeBusy)?;
     let epoch = native.epoch();
     if !pa.admit_app_generation(start.generation) { return Err(AppSourceError::Invalid); }
+    APP_STARTED.store(super::super::vclock_ms(),Ordering::Release);
+    APP_FIRST_PICTURE.store(-1,Ordering::Release); APP_LOAD_COMPLETED.store(-1,Ordering::Release);
+    APP_AUDIO_INFO.store(0,Ordering::Release); APP_SVP.store(0,Ordering::Release);
+    APP_ERROR_TYPE.store(0,Ordering::Release); APP_ERROR_NUMBER.store(0,Ordering::Release);
+    APP_PLAY_ATTEMPTS.store(0,Ordering::Release); APP_PLAY_ACKNOWLEDGED.store(0,Ordering::Release);
+    APP_FIRST_PLAY.store(-1,Ordering::Release); APP_LAST_PLAY.store(-1,Ordering::Release);
     let payload = CString::new(with_window_id_for_app(pa.mt(), &composed, &app_id))
         .map_err(|_| AppSourceError::Invalid)?;
     if sink().window_mode() == super::super::VP_EXPORTED
@@ -141,8 +241,9 @@ pub fn pump_app_source(pa: &mut super::super::adapter::PlayerAdapter, now: u32) 
     if eng.stage < Stage::Playing { return AppSourceStatus::Loading; }
     if TX.feed_allowed() { feed_both_lanes(mt,eng); }
     if SHARED.demux_io_failed.load(Ordering::Acquire) { return AppSourceStatus::Failed; }
-    if eng.eos_pushed && (SHARED.ended.load(Ordering::Relaxed)
-        || SHARED.playpos_ns.load(Ordering::Relaxed) >= SHARED.duration_ns.load(Ordering::Relaxed) - 1_000_000_000) {
+    // A position near duration proves progress, not a drained native pipeline.
+    // The app needs actual EOS before accepting its bounded hardware control.
+    if eng.eos_pushed && SHARED.ended.load(Ordering::Acquire) {
         AppSourceStatus::Ended
     } else if eng.prime_play || SHARED.frames.load(Ordering::Relaxed) == 0 {
         AppSourceStatus::Buffering

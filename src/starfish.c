@@ -453,6 +453,10 @@ static SfSlot *sf_current_slot(void) {
     return __atomic_load_n(&g_current, __ATOMIC_ACQUIRE);
 }
 
+int sf_cleanup_complete(void) {
+    return sf_current_slot() == NULL && !SMP_READY();
+}
+
 static void *sf_ready_object(void) {
     SfSlot *slot = sf_current_slot();
     return SMP_READY() && LOAD_RETURNED() && slot ? slot->object : NULL;

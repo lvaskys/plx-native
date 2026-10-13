@@ -37,8 +37,9 @@ queues, feed/prime and native teardown; ordinary copied-byte AUs remain supporte
 App-owned queue nodes retain an original output pointer and release callback.
 Admission and every disposal stay on the SDL thread; only successful enqueue
 transfers ownership. These contracts are exercised by `app_source_tests.rs`
-with the host sink, not hardware DRM. The embedding application's CENC/CDM source
-and LG sink integration remain separate work.
+with the host sink, not hardware DRM. The embedding application owns CENC/CDM
+preparation and the platform sink binding. The parent's 0.2.3 candidate now links
+that integration; host tests do not prove its hardware playback.
 
 App preroll uses an explicit Load-returned readiness policy, preserving the
 caller's appId/SVP facts. It does not manufacture loadCompleted. App Stop parks
@@ -46,6 +47,10 @@ any in-flight Load immediately; continue pumping while idle to reap it. Keep
 native/CDM resources alive until that retirement finishes. App generations
 cannot be reused within a PlayerAdapter lifetime. This prototype has no seek,
 source networking or full-stream API; it does not change Plex's completion gate.
+Feed may preroll after Load returns; app-source Play additionally waits for the
+real epoch-guarded loadCompleted callback. An empty-queue pump tick retries the
+prime after completion. A native Play acknowledgement alone is not proof of a
+running clock (the parent's failed 0.2.4 device run observed that distinction).
 
 ## Threading model (this is the whole ballgame)
 

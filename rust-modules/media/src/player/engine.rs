@@ -2454,6 +2454,16 @@ pub fn try_prime(mt: &MainThread, eng: &mut Engine) {
     if !eng.prime_play {
         return;
     }
+    // App BUFFERSTREAM needs Feed before loadCompleted, but a successful Play
+    // before that callback did not start the clock on the webOS24 DRM target.
+    // Keep feeding preroll while holding only Play. feed_both_lanes retries this
+    // check on an empty-queue tick after the actual epoch-guarded completion.
+    // Plex retains its existing completed-Load stage policy.
+    if matches!(eng.source, Source::AppOwned { .. })
+        && !SHARED.load_completed.load(Ordering::Acquire)
+    {
+        return;
+    }
     let Some(prime_kind) = SHARED.hls_prime_kind() else {
         return;
     };
@@ -2551,6 +2561,7 @@ pub fn try_prime(mt: &MainThread, eng: &mut Engine) {
             return;
         };
         let played = unsafe { sink().play(mt) };
+        if matches!(eng.source, Source::AppOwned { .. }) { app_source::note_app_play(played != 0); }
         match SHARED.complete_hls_prime_play(play_token, played != 0) {
             HlsPlayCompletion::Accepted { resume_acb } => {
                 if resume_acb {

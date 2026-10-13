@@ -41,6 +41,15 @@ pub struct Port {
     pub sink: &'static dyn sink::VideoSink,
 }
 
+impl Port {
+    /// Embed the native player without installing the Plex application's other
+    /// platform effects. All unprovided services retain the explicit no-port
+    /// answers, including unsupported secure storage and sandbox repair.
+    pub const fn sink_only(sink: &'static dyn sink::VideoSink) -> Self {
+        Self { sink, ..ABSENT }
+    }
+}
+
 fn nothing() {}
 
 /// No port installed: host unit tests (nothing calls `plex_run`). Every entry is what today's
