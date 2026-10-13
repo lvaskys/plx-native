@@ -7,6 +7,55 @@ use std::time::{Duration, Instant};
 use super::super::ffi_host;
 struct Owner { bytes: Vec<u8>, released: Rc<Cell<u32>> }
 #[test]
+fn app_pause_keeps_owners_and_resume_uses_balanced_prime() {
+    let _g=plx_base::testlock::serial();let mut pa=fresh();
+    let epoch=start_app_source(&mut pa,config(1)).unwrap();ready(&mut pa);
+    app_source_native_event(epoch,22,0);
+    let count=Rc::new(Cell::new(0));
+    enqueue(&mut pa,1,1,700_000_000,&count);enqueue(&mut pa,1,2,400_000_000,&count);
+    pump_app_source(&mut pa,super::super::vclock_ms());
+    let before=ffi_host::play_calls_for_test();assert!(!pa.engine().unwrap().prime_play);
+    assert!(set_app_source_paused(&mut pa,1,true));
+    assert_eq!(app_source_paused(&mut pa,1),Some(true));
+    assert!(set_app_source_paused(&mut pa,1,true)); // accepted intent is idempotent
+    enqueue(&mut pa,1,1,1_000_000_000,&count);enqueue(&mut pa,1,2,800_000_000,&count);
+    for _ in 0..3 {assert_eq!(pump_app_source(&mut pa,super::super::vclock_ms()),AppSourceStatus::Paused);}
+    assert_eq!(count.get(),2); // queued owners remain live, no Feed while paused
+    assert!(set_app_source_paused(&mut pa,1,false));
+    assert_eq!(ffi_host::play_calls_for_test(),before); // Resume itself cannot issue Play
+    assert!(pa.engine().unwrap().prime_play);
+    pump_app_source(&mut pa,super::super::vclock_ms());
+    assert_eq!(count.get(),4);assert_eq!(ffi_host::play_calls_for_test(),before+1);
+    assert!(stop_app_source(&mut pa,1));ffi_host::force_clocksink_for_test(false);
+}
+#[test]
+fn stale_pause_and_native_refusal_leave_the_current_transport_unchanged() {
+    let _g=plx_base::testlock::serial();let mut pa=fresh();
+    let epoch=start_app_source(&mut pa,config(9)).unwrap();ready(&mut pa);
+    app_source_native_event(epoch,22,0);let count=Rc::new(Cell::new(0));
+    enqueue(&mut pa,9,1,700_000_000,&count);enqueue(&mut pa,9,2,400_000_000,&count);
+    pump_app_source(&mut pa,super::super::vclock_ms());
+    assert!(!set_app_source_paused(&mut pa,8,true));assert_eq!(app_source_paused(&mut pa,8),None);
+    ffi_host::force_pause_result_for_test(Some(0));
+    assert!(!set_app_source_paused(&mut pa,9,true));assert_eq!(app_source_paused(&mut pa,9),Some(false));
+    ffi_host::force_pause_result_for_test(None);
+    assert!(set_app_source_paused(&mut pa,9,true));assert!(stop_app_source(&mut pa,9));
+    assert!(!set_app_source_paused(&mut pa,9,false));assert_eq!(app_source_paused(&mut pa,9),None);
+    ffi_host::force_clocksink_for_test(false);
+}
+#[test]
+fn loading_pause_and_resume_never_overtake_the_load_worker() {
+    let _g=plx_base::testlock::serial();let mut pa=fresh();ffi_host::hold_load_for_test();
+    start_app_source(&mut pa,config(1)).unwrap();
+    let since=Instant::now();while !ffi_host::load_in_flight_for_test(){
+        assert!(since.elapsed()<Duration::from_secs(2));std::thread::yield_now();
+    }
+    assert!(set_app_source_paused(&mut pa,1,true));assert!(set_app_source_paused(&mut pa,1,false));
+    assert_eq!(ffi_host::in_flight_calls_for_test(),0);
+    ffi_host::release_load_for_test();ready(&mut pa);assert!(stop_app_source(&mut pa,1));
+    ffi_host::force_clocksink_for_test(false);
+}
+#[test]
 fn numeric_app_events_are_epoch_guarded_and_fail_on_midplay_error() {
     let _g=plx_base::testlock::serial();let mut pa=fresh();
     let first=start_app_source(&mut pa,config(1)).unwrap();ready(&mut pa);

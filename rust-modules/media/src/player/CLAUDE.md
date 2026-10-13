@@ -52,6 +52,14 @@ real epoch-guarded loadCompleted callback. An empty-queue pump tick retries the
 prime after completion. A native Play acknowledgement alone is not proof of a
 running clock (the parent's failed 0.2.4 device run observed that distinction).
 
+`set_app_source_paused` / `app_source_paused` scope viewer transport intent to
+the live app generation. They reuse `player::pause` / `resume` and the existing
+clock actuator: refused Pause does not change intent, paused pumps retain queue
+owners without Feed, and Resume opens feeding before balanced prime issues Play.
+Logical Pause/Resume during an initial held Load cannot overtake that worker.
+`AppSourceStatus::Paused` reports accepted intent, not a physical-presentation
+measurement. These entries own no provider refresh, source seek or UI state.
+
 ## Threading model (this is the whole ballgame)
 
 - `engine.rs` — the **main-thread-confined** session object. All ACB/Starfish *control* calls happen

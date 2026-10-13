@@ -19,7 +19,7 @@ pub enum AppSourceError { Invalid, Busy, NativeBusy, StartFailed }
 #[derive(Debug, PartialEq, Eq)]
 pub enum AppEnqueue { Accepted, Full, Invalid, Stale }
 #[derive(Debug, PartialEq, Eq)]
-pub enum AppSourceStatus { Idle, Loading, Buffering, Playing, Ended, Failed }
+pub enum AppSourceStatus { Idle, Loading, Buffering, Playing, Ended, Failed, Paused }
 
 static APP_STARTED: AtomicU32 = AtomicU32::new(0);
 static APP_FIRST_PICTURE: AtomicI64 = AtomicI64::new(-1);
@@ -191,6 +191,24 @@ fn owns(eng: &Engine, generation: u64) -> bool {
     matches!(eng.source, Source::AppOwned { generation: current } if generation != 0 && current == generation)
 }
 
+/// Generation-scoped viewer intent, through the existing actuator and balanced
+/// resume-prime protocol. In particular, no direct sink verb or route/Plex effect.
+pub fn set_app_source_paused(pa:&mut super::super::adapter::PlayerAdapter,
+    generation:u64,paused:bool)->bool {
+    if !pa.engine().is_some_and(|eng|owns(eng,generation))
+        || SHARED.load_failed.load(Ordering::Acquire)
+        || SHARED.demux_io_failed.load(Ordering::Acquire)
+        || SHARED.ended.load(Ordering::Acquire) {return false;}
+    if TX.paused.load(Ordering::Acquire)==paused {return true;}
+    if paused {super::super::pause(pa)} else {super::super::resume(pa)}
+}
+
+/// Current accepted intent only. No live matching source means no state.
+pub fn app_source_paused(pa:&mut super::super::adapter::PlayerAdapter,generation:u64)->Option<bool>{
+    pa.engine().filter(|eng|owns(eng,generation))
+        .map(|_|TX.paused.load(Ordering::Acquire))
+}
+
 /// Only Accepted transfers owner; every other result leaves it with the caller.
 /// # Safety
 /// Called serially on pa's SDL thread. data/owner remain live until release;
@@ -245,6 +263,8 @@ pub fn pump_app_source(pa: &mut super::super::adapter::PlayerAdapter, now: u32) 
     // The app needs actual EOS before accepting its bounded hardware control.
     if eng.eos_pushed && SHARED.ended.load(Ordering::Acquire) {
         AppSourceStatus::Ended
+    } else if TX.paused.load(Ordering::Acquire) {
+        AppSourceStatus::Paused
     } else if eng.prime_play || SHARED.frames.load(Ordering::Relaxed) == 0 {
         AppSourceStatus::Buffering
     } else { AppSourceStatus::Playing }
