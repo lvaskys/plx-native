@@ -258,9 +258,9 @@ fn invalid_configuration_and_overlapping_start_leave_the_live_owner_intact() {
 }
 
 #[test]
-fn bounded_replenishment_accepts_six_minutes_and_refuses_larger_duration() {
+fn app_duration_accepts_bounded_preview_and_fractional_episode_with_one_hour_ceiling() {
     let _g = plx_base::testlock::serial(); let mut pa=fresh();
-    for duration in [0, -1, 360_000_000_001, i64::MAX] {
+    for duration in [0, -1, 3_600_000_000_001, i64::MAX] {
         let mut bad=config(1); bad.duration_ns=duration;
         assert!(matches!(start_app_source(&mut pa,bad),Err(AppSourceError::Invalid)));
         assert!(pa.engine().is_none());
@@ -268,7 +268,14 @@ fn bounded_replenishment_accepts_six_minutes_and_refuses_larger_duration() {
     let mut bounded=config(1); bounded.duration_ns=360_000_000_000;
     start_app_source(&mut pa,bounded).unwrap(); ready(&mut pa);
     assert_eq!(SHARED.duration_ns.load(Ordering::Relaxed),360_000_000_000);
-    assert!(stop_app_source(&mut pa,1)); ffi_host::force_clocksink_for_test(false);
+    assert!(stop_app_source(&mut pa,1));
+    for (generation,duration) in [(2,1_441_451_000_000),(3,3_600_000_000_000)] {
+        let mut episode=config(generation);episode.duration_ns=duration;
+        start_app_source(&mut pa,episode).unwrap();ready(&mut pa);
+        assert_eq!(SHARED.duration_ns.load(Ordering::Relaxed),duration);
+        assert!(stop_app_source(&mut pa,generation));
+    }
+    ffi_host::force_clocksink_for_test(false);
 }
 
 #[test]
