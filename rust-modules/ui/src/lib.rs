@@ -43,6 +43,7 @@ pub mod document_reader;
 pub mod fit; // one declared-priority primitive for a line with two competing runs (`two_runs`)
 pub mod fixture; // RESTRUCTURE spike: `FixtureHost` — the bundle the generic library is tested against
 pub mod focus; // RESTRUCTURE (spec §7.3): the focus ENGINE — one owner of focus, the golden tables
+pub mod player_transport; // value-based player chrome, shared with appkit and embedded players
 pub mod fmt; // shared duration/clock display formatters
 pub mod dwell; // raw dwell accumulator; notes Motion, never a Ramp
 pub mod frame; // RESTRUCTURE spike (spec §8.1): `Budget`, admission control for prepare work
