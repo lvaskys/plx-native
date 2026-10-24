@@ -45,15 +45,15 @@ App preroll uses an explicit Load-returned readiness policy, preserving the
 caller's appId/SVP facts. It does not manufacture loadCompleted. App Stop parks
 any in-flight Load immediately; continue pumping while idle to reap it. Keep
 native/CDM resources alive until that retirement finishes. App generations
-cannot be reused within a PlayerAdapter lifetime. This prototype has no seek,
-source networking or full-stream API; it does not change Plex's completion gate.
+cannot be reused within a PlayerAdapter lifetime. The Engine owns no source
+networking; it does not change Plex's completion gate.
 The app duration ceiling is now one hour, including fractional episode ends.
 The embedding source validates complete finite media coverage and owns its
 preview/full-episode policy; this bound changes no Engine queue/pacing policy.
 The embedding source owns incremental encrypted input; this Engine still owns
 AU admission, Feed pacing, native stages and EOS. Temporary source starvation
-must not publish lane EOF. This extension does not accept full-episode playback,
-provider renewal or seeking.
+must not publish lane EOF. This extension does not validate full-episode playback
+or provider renewal.
 Feed may preroll after Load returns; app-source Play additionally waits for the
 real epoch-guarded loadCompleted callback. An empty-queue pump tick retries the
 prime after completion. A native Play acknowledgement alone is not proof of a
@@ -66,6 +66,20 @@ owners without Feed, and Resume opens feeding before balanced prime issues Play.
 Logical Pause/Resume during an initial held Load cannot overtake that worker.
 `AppSourceStatus::Paused` reports accepted intent, not a physical-presentation
 measurement. These entries own no provider refresh, source seek or UI state.
+
+The explicit `begin_app_source_seek` / commit / abort API retains a ready native
+Engine while replacing its app-owned queue generation. Begin requires the
+embedding producer to be stopped; it holds the shared seek clock, fences media
+callbacks and drains pending/queued owners on the main thread. Commit requires
+window-local timestamps: the first video AU must be a keyframe at zero. The
+shared Feed path calls public Seek(0) once, retains the exact owner on BufferFull
+and primes both lanes. Paused windows feed only after Resume. EOS stays fenced
+until the new source actually submits EOS. Failed/refused handoffs require real
+Stop/reload; the reserved generation is burned. Tickets bind the native epoch
+and both generations. The external source/UI still owns episode-origin mapping,
+source-worker retirement, renewal and timeout/fallback policy. Initial start
+still selects Reload. Host contract tests do not establish LG protected Seek
+support, hardware acceptance or a performance improvement.
 
 ## Threading model (this is the whole ballgame)
 

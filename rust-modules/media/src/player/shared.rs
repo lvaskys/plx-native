@@ -238,6 +238,9 @@ enum NativeSessionPhase {
         /// in-place seek closes this while old decoded frames are flushed, then the first real
         /// post-seek keyframe reopens it.
         presentation_gate: NativePresentationGate,
+        /// After a discontinuity, an old EOS cannot end the new timeline.
+        /// Reopened only when the current source actually submits native EOS.
+        media_end_armed: bool,
         /// See [`LoadCall`]. Epoch-scoped exactly like `presentation_gate`: a late `load_thread`
         /// from a SUPERSEDED session can never flip this for a newer one, because
         /// `mark_native_load_returned`/`native_load_returned` both require `epoch == active`.
@@ -314,6 +317,7 @@ impl NativeSessionState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeEventClass {
     Presentation,
+    MediaEnd,
     UnloadCompleted,
     Other,
 }
@@ -1077,6 +1081,7 @@ impl Shared {
         state.phase = NativeSessionPhase::Active {
             epoch,
             presentation_gate: NativePresentationGate::Armed,
+            media_end_armed: true,
             load_call: LoadCall::InFlight,
             load_issued_at: Instant::now(),
         };
@@ -1340,11 +1345,27 @@ impl Shared {
             NativeSessionPhase::Active {
                 epoch: active,
                 presentation_gate,
+                media_end_armed,
                 ..
             } if epoch != 0 && *active == epoch => {
                 *presentation_gate = NativePresentationGate::Disarmed;
+                *media_end_armed = false;
                 true
             }
+            _ => false,
+        }
+    }
+
+    /// Reserve EOS callback admission before entering the native verb, which
+    /// may synchronously reenter. Never hold the callback mutex across FFI.
+    pub fn arm_native_media_end(&self, epoch: u32) -> bool {
+        let mut state = self.native_session.lock().unwrap_or_else(|e| e.into_inner());
+        match &mut state.phase {
+            NativeSessionPhase::Active { epoch: active, media_end_armed, .. }
+                if epoch != 0 && *active == epoch => {
+                    *media_end_armed = true;
+                    true
+                }
             _ => false,
         }
     }
@@ -1494,6 +1515,7 @@ impl Shared {
         let NativeSessionPhase::Active {
             epoch: active,
             presentation_gate,
+            media_end_armed,
             ..
         } = &mut state.phase
         else {
@@ -1511,6 +1533,10 @@ impl Shared {
                     return None;
                 }
             }
+        }
+        if class == NativeEventClass::MediaEnd
+            && (!*media_end_armed || *presentation_gate != NativePresentationGate::Armed) {
+            return None;
         }
         let result = event(EventScope::Live);
         if class == NativeEventClass::UnloadCompleted {

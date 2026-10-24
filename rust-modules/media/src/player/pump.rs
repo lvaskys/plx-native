@@ -4,7 +4,7 @@
 use super::engine::{
     arm_live_clock_prime, drain_aq, feed_both_lanes, feed_sample, Engine, Source,
 };
-use super::shared::{HlsPauseCompletion, HlsPrimeKind, HlsSeekPause, Stage};
+use super::shared::{HlsPauseCompletion, HlsPrimeKind, Stage};
 use super::{seek_mode, SeekMode, ACB_OK, SHARED, TX};
 use plx_base::task::MainThread;
 use std::os::raw::c_char;
@@ -1706,48 +1706,28 @@ pub fn pump(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
         // Pause, user-held seek reuse and eventual prime all share one actuator state. In
         // particular a seek from Paused must not issue a redundant native Pause, and a result from
         // an older transition must not authorize flushing this session's queues.
-        match SHARED.prepare_seek_pause() {
-            Some(HlsSeekPause::AlreadyHeld) => {}
-            Some(HlsSeekPause::Issue(token)) => {
-                let accepted = unsafe { super::sink().pause(mt) } != 0;
-                match SHARED.complete_seek_pause(token, accepted) {
-                    HlsPauseCompletion::Accepted => {}
-                    HlsPauseCompletion::Refused => {
-                        super::log("seek(in-place): Starfish refused Pause → reload fallback");
-                        crate::route::commit_user_seek();
-                        own_seek_under_pause(t);
-                        settle_reload(
-                            super::engine::reload_at(ps, pa, t),
-                            "seek reload after native Pause refusal",
-                        );
-                        return;
-                    }
-                    HlsPauseCompletion::Stale => {
-                        super::log("seek(in-place): stale Pause result → reload fallback");
-                        crate::route::commit_user_seek();
-                        own_seek_under_pause(t);
-                        settle_reload(
-                            super::engine::reload_at(ps, pa, t),
-                            "seek reload after stale Pause",
-                        );
-                        return;
-                    }
-                }
+        match super::engine::hold_native_clock_for_seek(mt) {
+            Some(HlsPauseCompletion::Accepted) => {}
+            Some(HlsPauseCompletion::Refused) => {
+                super::log("seek(in-place): Starfish refused Pause → reload fallback");
+                crate::route::commit_user_seek();own_seek_under_pause(t);
+                settle_reload(super::engine::reload_at(ps, pa, t), "seek reload after native Pause refusal");return;
+            }
+            Some(HlsPauseCompletion::Stale) => {
+                super::log("seek(in-place): stale Pause result → reload fallback");
+                crate::route::commit_user_seek();own_seek_under_pause(t);
+                settle_reload(super::engine::reload_at(ps, pa, t), "seek reload after stale Pause");return;
             }
             None => {
-                // The main-thread transition in flight will settle before the next pump tick. Keep
-                // the newest seek mailbox intact rather than consuming it into no operation.
-                TX.seek_to_ns.store(t, Release);
-                TX.seek_reqs.store(1, Release);
-                super::log("seek(in-place): clock transition busy; retrying");
-                return;
+                TX.seek_to_ns.store(t, Release);TX.seek_reqs.store(1, Release);
+                super::log("seek(in-place): clock transition busy; retrying");return;
             }
         }
         if !SHARED.begin_native_media_discontinuity(eng.native_epoch) {
             crate::route::commit_user_seek();
             super::log("seek(in-place): native callback epoch retired → reload fallback");
             own_seek_under_pause(t);
-                        settle_reload(
+            settle_reload(
                 super::engine::reload_at(ps, pa, t),
                 "seek reload after retired native epoch",
             );
@@ -1773,44 +1753,12 @@ pub fn pump(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
         // on — no reopen, no seek, and every direct-play seek escalated to a reload. See ff.rs.
         // eng.flushed → feed_stream fires setTimeToDecode+sendSegmentEvent on the first post-seek
         // keyframe. disp_base=0 (rebase to the landed keyframe).
-        eng.flushed = true;
-        eng.presentation_rearm_pending = false;
-        SHARED.seek_to_ns.store(t, Release); // the demux thread's av_seek target
-        SHARED.seek_target_ns.store(t, Relaxed); // rebase guard: reject stale drifted keyframes
+        SHARED.seek_to_ns.store(t, Release); // ffmpeg owns the original/content-time seek
+        SHARED.seek_target_ns.store(t, Relaxed);
         SHARED.disp_base.store(0, Relaxed);
-        super::log(&format!(
-            "seek(in-place): av_seek t={t} coalesced={coalesced}"
-        ));
-        // zero-base the fed timeline on the first post-seek keyframe (feed_stream), so it
-        // presents against the flush-reset clock immediately — no catch-up freeze
-        eng.rebase_pending = true;
-        eng.rebase_drops = 0;
-        // A seek armed under a viewer Pause: the pump opens the preroll and closes it on the landing.
+        super::log(&format!("seek(in-place): av_seek t={t} coalesced={coalesced}"));
+        super::engine::reset_seek_feed_state(eng, t, now);
         own_seek_under_pause(t);
-        eng.seek_armed_at = now; // stuck-watchdog start (see the coalesce/escape above)
-        eng.seek_retries = 0;
-        eng.max_fed_video_pts = 0;
-        eng.max_fed_audio_pts = 0;
-        eng.audio_start_fp = None;
-        // Drop any AU held from BEFORE the seek (the per-lane BufferFull retry). drain_aq cleared the
-        // QUEUES but not these pending AUs; feeding a stale pre-seek AU after the seek re-bases it to
-        // the NEW pts_shift → a big A/V desync — the stale audio pts advances max_fed_audio_pts, then
-        // the STALE_BACKJUMP guard drops the fresh post-seek audio as "too far back" → no sound. The
-        // reopened stream supplies fresh post-seek AUs.
-        eng.pending_video = None;
-        eng.pending_audio = None;
-        eng.prime_play = true; // paused above; Play once PRIME_NS is buffered (no fast-forward)
-                               // "no post-seek frame presented yet" — the feed-ahead throttle feeds freely until the first
-                               // real presented pts lands, instead of comparing the new fed pts against the STALE pre-seek
-                               // presented position (which would wrongly break feeding on a forward in-place seek).
-        SHARED.pres_fed.store(super::engine::PRES_NONE, Relaxed);
-        eng.feed_pace = super::engine::FeedPace::default(); // the run-on belongs to the pre-seek report
-        SHARED.frames.store(0, Relaxed); // count only POST-seek frames (rebind + resume re-pause gate)
-                                         // …and forget the last presentation stamp with it. The plane goes dark across a seek by
-                                         // design, so the first frame after one would otherwise post a gap the size of the seek and
-                                         // read as a stutter (`Shared`'s `dg_vpres_*` block).
-        SHARED.dg_vpres_at.store(0, Relaxed);
-        SHARED.playpos_ns.store(t, Relaxed); // displayed position jumps; wall clock takes over
     }
 
     // ---------- load -> Play (decode fed frames as soon as loaded) ----------

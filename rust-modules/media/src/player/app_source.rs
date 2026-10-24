@@ -6,7 +6,7 @@ use std::os::raw::c_void;
 use std::sync::atomic::{AtomicI32, AtomicU32};
 
 /// Prototype limit: caller supplies validated H264/AAC/SVP Load facts and
-/// already prepared output. Duration is capped to the bounded six-minute renewal test.
+/// already prepared output. Duration is capped to one finite hour.
 /// This is not the eventual streaming-source API or validation of a DASH URL.
 pub struct AppSourceStart {
     pub generation: u64,
@@ -20,6 +20,19 @@ pub enum AppSourceError { Invalid, Busy, NativeBusy, StartFailed }
 pub enum AppEnqueue { Accepted, Full, Invalid, Stale }
 #[derive(Debug, PartialEq, Eq)]
 pub enum AppSourceStatus { Idle, Loading, Buffering, Playing, Ended, Failed, Paused }
+
+#[path = "app_source_seek.rs"]
+mod seek;
+pub use seek::{begin_app_source_seek,commit_app_source_seek,abort_app_source_seek,app_source_seek_status};
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct AppSourceSeekTicket { epoch:u32, previous:u64, next:u64, paused:bool }
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum AppSourceSeekError { Invalid, NotReady, ReloadRequired }
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum AppSourceSeekStatus { Preparing, Priming, Ready, ReloadRequired, Failed, Stale }
+#[derive(Clone,Copy,PartialEq,Eq)]
+enum AppSeekPhase { Preparing, Feeding, ReloadRequired }
+pub(super) struct AppSeekTransaction { ticket:AppSourceSeekTicket, phase:AppSeekPhase, first_video:bool }
 
 static APP_STARTED: AtomicU32 = AtomicU32::new(0);
 static APP_FIRST_PICTURE: AtomicI64 = AtomicI64::new(-1);
@@ -86,6 +99,7 @@ pub fn app_source_native_event(epoch: u32, ty: c_int, num: i64) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let class = match ty {
             0 => super::super::shared::NativeEventClass::Presentation,
+            28 => super::super::shared::NativeEventClass::MediaEnd,
             23 => super::super::shared::NativeEventClass::UnloadCompleted,
             _ => super::super::shared::NativeEventClass::Other,
         };
@@ -184,8 +198,8 @@ pub fn start_app_source(pa: &mut super::super::adapter::PlayerAdapter, start: Ap
     eng.aq_video = Some(crate::aq::aq_new(AQ_VIDEO_BYTES));
     eng.aq_audio = Some(crate::aq::aq_new(AQ_AUDIO_BYTES));
     eng.load_th = Some(load);
-    // The external adapter has no private in-place-seek policy. Seeking is
-    // deliberately absent from this bounded integration entry.
+    // Initial start keeps reload policy. Only the explicit app seek contract
+    // may opt into a retained native segment after validating its handoff.
     super::super::set_seek_mode(super::super::SeekMode::Reload);
     pa.install(eng); native.commit(); clock.commit();
     TX.started.store(true, Ordering::Relaxed);
@@ -201,6 +215,7 @@ fn owns(eng: &Engine, generation: u64) -> bool {
 pub fn set_app_source_paused(pa:&mut super::super::adapter::PlayerAdapter,
     generation:u64,paused:bool)->bool {
     if !pa.engine().is_some_and(|eng|owns(eng,generation))
+        || pa.engine().is_some_and(seek::input_blocked)
         || SHARED.load_failed.load(Ordering::Acquire)
         || SHARED.demux_io_failed.load(Ordering::Acquire)
         || SHARED.ended.load(Ordering::Acquire) {return false;}
@@ -225,19 +240,24 @@ pub unsafe fn app_source_enqueue(pa: &mut super::super::adapter::PlayerAdapter,
     owner: *mut c_void, release: Option<unsafe extern "C" fn(*mut c_void)>) -> AppEnqueue {
     let Some(eng) = pa.engine() else { return AppEnqueue::Stale; };
     if !owns(eng,generation) { return AppEnqueue::Stale; }
+    if seek::input_blocked(eng) { return AppEnqueue::Invalid; }
     if !(1..=2).contains(&lane) || !(1..=1024*1024).contains(&len)
         || pts_ns < 0 || SHARED.demux_io_failed.load(Ordering::Acquire)
         || SHARED.load_failed.load(Ordering::Acquire) { return AppEnqueue::Invalid; }
+    if lane==1&&eng.app_seek.as_ref().is_some_and(|s|s.first_video)&&(key==0||pts_ns!=0){return AppEnqueue::Invalid;}
     let q = if lane == 1 { &mut eng.aq_video } else { &mut eng.aq_audio };
     let Some(q) = q.as_mut() else { return AppEnqueue::Invalid; };
-    match crate::aq::aq_try_push_owned(&mut **q, data, len, pts_ns, key, lane, owner, release) {
+    let result=match crate::aq::aq_try_push_owned(&mut **q, data, len, pts_ns, key, lane, owner, release) {
         0 => AppEnqueue::Accepted, 1 => AppEnqueue::Full, _ => AppEnqueue::Invalid,
-    }
+    };
+    if lane==1&&result==AppEnqueue::Accepted {if let Some(s)=eng.app_seek.as_mut(){s.first_video=false;}}
+    result
 }
 
 pub fn app_source_eof(pa: &mut super::super::adapter::PlayerAdapter, generation: u64, lane: c_int) -> bool {
     let Some(eng) = pa.engine() else { return false; };
     if !owns(eng,generation) || !(1..=2).contains(&lane) { return false; }
+    if seek::input_blocked(eng)||eng.app_seek.as_ref().is_some_and(|s|s.first_video){return false;}
     let q = if lane == 1 { &mut eng.aq_video } else { &mut eng.aq_audio };
     let Some(q) = q.as_mut() else { return false; };
     crate::aq::aq_set_eof(&mut **q); true
@@ -255,6 +275,7 @@ pub fn pump_app_source(pa: &mut super::super::adapter::PlayerAdapter, now: u32) 
     if SHARED.load_failed.load(Ordering::Acquire) || SHARED.demux_io_failed.load(Ordering::Acquire) {
         return AppSourceStatus::Failed;
     }
+    if let Some(status)=seek::pump_guard(eng){return status;}
     // No other native verb before Load returns, including loadCompleted polling.
     if eng.stage == Stage::Loading && !super::super::pump::native_load_gate_ready(eng.native_epoch, false) {
         return if SHARED.load_failed.load(Ordering::Acquire) { AppSourceStatus::Failed } else { AppSourceStatus::Loading };
@@ -263,6 +284,7 @@ pub fn pump_app_source(pa: &mut super::super::adapter::PlayerAdapter, now: u32) 
     if SHARED.load_failed.load(Ordering::Acquire) { return AppSourceStatus::Failed; }
     if eng.stage < Stage::Playing { return AppSourceStatus::Loading; }
     if TX.feed_allowed() { feed_both_lanes(mt,eng); }
+    if let Some(status)=seek::pump_guard(eng){return status;}
     if SHARED.demux_io_failed.load(Ordering::Acquire) { return AppSourceStatus::Failed; }
     // A position near duration proves progress, not a drained native pipeline.
     // The app needs actual EOS before accepting its bounded hardware control.

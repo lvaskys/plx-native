@@ -237,6 +237,7 @@ pub struct Engine {
     #[allow(dead_code)]
     pub payload: std::ffi::CString, // bf_payload (kept alive for the session)
     pub source: Source,
+    app_seek: Option<app_source::AppSeekTransaction>,
     pub stream_th: Option<std::thread::JoinHandle<()>>,
     pub load_th: Option<std::thread::JoinHandle<()>>,
     pub report_th: Option<std::thread::JoinHandle<()>>, // /:/timeline progress reporter
@@ -279,6 +280,7 @@ impl Engine {
             pending_audio: None,
             payload,
             source,
+            app_seek: None,
             stream_th: None,
             load_th: None,
             report_th: None,
@@ -1827,6 +1829,32 @@ pub fn arm_seek(target_ns: i64) {
     SHARED.playpos_ns.store(t, Ordering::Relaxed); // instant HUD feedback until frames land
 }
 
+/// Shared clock actuator for stream and app-owned seek boundaries. Native calls
+/// happen outside the clock mutex, then settle the reserved token once.
+pub(super) fn hold_native_clock_for_seek(mt:&MainThread)->Option<super::shared::HlsPauseCompletion>{
+    use super::shared::{HlsSeekPause,HlsPauseCompletion};
+    match SHARED.prepare_seek_pause(){
+        Some(HlsSeekPause::AlreadyHeld)=>Some(HlsPauseCompletion::Accepted),
+        Some(HlsSeekPause::Issue(token))=>{
+            let accepted=unsafe{sink().pause(mt)}!=0;
+            Some(SHARED.complete_seek_pause(token,accepted))
+        }
+        None=>None,
+    }
+}
+
+/// Queue/source-specific producers are fenced by the caller. Both seek paths
+/// reset exactly the same pending outputs, prime, pacing and frame observations.
+pub(super) fn reset_seek_feed_state(eng:&mut Engine,target_ns:i64,now:u32){
+    eng.flushed=true;eng.presentation_rearm_pending=false;eng.rebase_pending=true;
+    eng.rebase_drops=0;eng.seek_armed_at=now;eng.seek_retries=0;
+    eng.max_fed_video_pts=0;eng.max_fed_audio_pts=0;eng.audio_start_fp=None;
+    eng.pending_video=None;eng.pending_audio=None;eng.prime_play=true;
+    SHARED.pres_fed.store(PRES_NONE,Ordering::Relaxed);eng.feed_pace=FeedPace::default();
+    SHARED.frames.store(0,Ordering::Relaxed);SHARED.dg_vpres_at.store(0,Ordering::Relaxed);
+    SHARED.playpos_ns.store(target_ns,Ordering::Relaxed);
+}
+
 /// Resume/seek AT the first Load. A direct-play item seeks the demuxer (av_seek via arm_seek).
 /// A TRANSCODE item's stream is 0-based and NOT seekable (no byte-index, Content-Length=-1), so
 /// av_seek fails — instead restart the encode at `&offset=secs` and display content time via
@@ -2970,9 +2998,11 @@ fn feed_stream(mt: &MainThread, eng: &mut Engine) {
                 if eof != 0 && !eng.eos_pushed && eng.stage >= Stage::Streaming
                     && (!matches!(eng.source, Source::AppOwned { .. })
                         || (eng.pending_audio.is_none() && eng.aq_audio.as_mut().is_some_and(|q| crate::aq::aq_drained_eof(&mut **q)))) {
-                    unsafe { sink().push_eos(mt) };
-                    eng.eos_pushed = true;
-                    log("EOS pushed at true EOF");
+                    if SHARED.arm_native_media_end(eng.native_epoch) {
+                        unsafe { sink().push_eos(mt) };
+                        eng.eos_pushed = true;
+                        log("EOS pushed at true EOF");
+                    }
                 }
                 // Nothing to send. THE case the read-out's Feed row exists to name: a dead
                 // PRODUCER, which every other field on the panel cannot tell from a dead sink.
@@ -4360,6 +4390,7 @@ mod prime_livelock_tests {
             pending_audio: None,
             payload: std::ffi::CString::new("").unwrap(),
             source: Source::Stream,
+            app_seek: None,
             stream_th: None,
             load_th: None,
             report_th: None,

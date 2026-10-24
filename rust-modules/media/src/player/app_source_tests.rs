@@ -81,9 +81,149 @@ unsafe extern "C" fn release(p: *mut c_void) {
 }
 fn fresh() -> super::super::adapter::PlayerAdapter {
     SHARED.reset_session(); TX.reset();
+    super::super::set_native_seek_refused(false);ffi_host::reset_seek_probe_for_test(None);
     ffi_host::reset_native_lifecycle_for_test();
     ffi_host::force_clocksink_for_test(true);
     super::super::adapter::PlayerAdapter::new(unsafe { MainThread::assume() })
+}
+
+fn running_app_source(pa:&mut super::super::adapter::PlayerAdapter,generation:u64)->u32 {
+    let epoch=start_app_source(pa,config(generation)).unwrap();ready(pa);app_source_native_event(epoch,22,0);
+    let released=Rc::new(Cell::new(0));enqueue(pa,generation,1,700_000_000,&released);enqueue(pa,generation,2,400_000_000,&released);
+    pump_app_source(pa,super::super::vclock_ms());app_source_native_event(epoch,0,1_000_000_000);
+    assert!(!pa.engine().unwrap().prime_play);epoch
+}
+
+#[test]
+fn app_seek_fences_pending_and_queued_owners_then_reuses_the_native_segment_at_zero() {
+    let _g=plx_base::testlock::serial();let mut pa=fresh();let epoch=running_app_source(&mut pa,1);
+    let count=Rc::new(Cell::new(0));
+    enqueue(&mut pa,1,1,2_000_000_000,&count);ffi_host::owned_feed_script_for_test(vec![b'B']);
+    pump_app_source(&mut pa,super::super::vclock_ms());assert!(pa.engine().unwrap().pending_video.is_some());
+    enqueue(&mut pa,1,1,2_100_000_000,&count);enqueue(&mut pa,1,2,2_000_000_000,&count);
+    assert!(app_source_eof(&mut pa,1,1));assert!(app_source_eof(&mut pa,1,2));
+    assert_eq!(count.get(),0);
+    let ticket=begin_app_source_seek(&mut pa,1,2).unwrap();assert_eq!(count.get(),3);
+    assert_eq!(app_source_seek_status(&mut pa,ticket),AppSourceSeekStatus::Preparing);
+    app_source_native_event(epoch,0,8_000_000_000); // old timeline is fenced
+    app_source_native_event(epoch,28,0);assert_eq!(app_source_metrics().eos,0);
+    let held=app_source_metrics().position_ns;for _ in 0..3 {pump_app_source(&mut pa,super::super::vclock_ms());}
+    assert_eq!(app_source_metrics().position_ns,held);
+    assert_eq!(begin_app_source_seek(&mut pa,1,3),Err(AppSourceSeekError::NotReady));
+    assert!(!set_app_source_paused(&mut pa,1,false));assert!(!app_source_eof(&mut pa,1,1));
+    assert_eq!(commit_app_source_seek(&mut pa,ticket,20_000_000_000),Ok(()));
+    assert_eq!(commit_app_source_seek(&mut pa,ticket,20_000_000_000),Err(AppSourceSeekError::Invalid));
+    assert_eq!(pa.engine().unwrap().native_epoch,epoch);assert!(!SHARED.ended.load(Ordering::Acquire));
+    let rejected=Rc::new(Cell::new(0));assert_eq!(enqueue(&mut pa,1,1,0,&rejected).1,AppEnqueue::Stale);
+    assert_eq!(enqueue(&mut pa,2,1,1_000_000,&rejected).1,AppEnqueue::Invalid); // first keyframe must be local zero
+    let output=Rc::new(Cell::new(0));let (pointer,status)=enqueue(&mut pa,2,1,0,&output);assert_eq!(status,AppEnqueue::Accepted);
+    ffi_host::owned_feed_script_for_test(vec![b'B',b'O']);pump_app_source(&mut pa,super::super::vclock_ms());
+    assert_eq!(ffi_host::seek_log_for_test(),vec![0]);assert_eq!(output.get(),0);
+    pump_app_source(&mut pa,super::super::vclock_ms());assert_eq!(output.get(),1);
+    assert_eq!(ffi_host::seek_log_for_test(),vec![0]);assert_eq!(ffi_host::flush_calls_for_test(),0);assert_eq!(ffi_host::segment_calls_for_test(),0);
+    let feeds=ffi_host::take_owned_feeds_for_test();
+    assert_eq!(&feeds[feeds.len()-2..],&[(pointer as usize,5,0,1),(pointer as usize,5,0,1)]);
+    enqueue(&mut pa,2,1,700_000_000,&output);enqueue(&mut pa,2,2,400_000_000,&output);
+    pump_app_source(&mut pa,super::super::vclock_ms());app_source_native_event(epoch,0,400_000_000);
+    assert_eq!(app_source_seek_status(&mut pa,ticket),AppSourceSeekStatus::Ready);
+    app_source_native_event(epoch,28,0); // late old EOS after new Feed is still stale
+    assert_eq!(app_source_metrics().eos,0);
+    assert!(!stop_app_source(&mut pa,1));assert!(stop_app_source(&mut pa,2));ffi_host::force_clocksink_for_test(false);
+}
+
+#[test]
+fn app_seek_pause_abort_and_native_refusal_require_explicit_reload_cleanup() {
+    let _g=plx_base::testlock::serial();let mut pa=fresh();running_app_source(&mut pa,1);
+    assert!(set_app_source_paused(&mut pa,1,true));let plays=ffi_host::play_calls_for_test();
+    let ticket=begin_app_source_seek(&mut pa,1,2).unwrap();assert_eq!(commit_app_source_seek(&mut pa,ticket,15_000_000_000),Ok(()));
+    let count=Rc::new(Cell::new(0));enqueue(&mut pa,2,1,0,&count);enqueue(&mut pa,2,1,700_000_000,&count);enqueue(&mut pa,2,2,400_000_000,&count);
+    for _ in 0..3 {assert_eq!(pump_app_source(&mut pa,super::super::vclock_ms()),AppSourceStatus::Paused);}
+    assert_eq!(count.get(),0);assert!(ffi_host::seek_log_for_test().is_empty());assert_eq!(ffi_host::play_calls_for_test(),plays);
+    assert!(set_app_source_paused(&mut pa,2,false));pump_app_source(&mut pa,super::super::vclock_ms());
+    assert_eq!(ffi_host::seek_log_for_test(),vec![0]);assert_eq!(count.get(),3);assert_eq!(ffi_host::play_calls_for_test(),plays+1);
+    assert!(stop_app_source(&mut pa,2));
+    let mut pa=fresh();running_app_source(&mut pa,4);let ticket=begin_app_source_seek(&mut pa,4,5).unwrap();
+    assert!(abort_app_source_seek(&mut pa,ticket));assert_eq!(app_source_seek_status(&mut pa,ticket),AppSourceSeekStatus::ReloadRequired);
+    assert_eq!(pump_app_source(&mut pa,super::super::vclock_ms()),AppSourceStatus::Failed);assert!(stop_app_source(&mut pa,4));
+    assert!(matches!(start_app_source(&mut pa,config(5)),Err(AppSourceError::Invalid))); // abandoned generation is burned
+    start_app_source(&mut pa,config(6)).unwrap();ready(&mut pa);assert!(stop_app_source(&mut pa,6));
+    let mut pa=fresh();let epoch=running_app_source(&mut pa,9);let ticket=begin_app_source_seek(&mut pa,9,10).unwrap();
+    commit_app_source_seek(&mut pa,ticket,10_000_000_000).unwrap();ffi_host::reset_seek_probe_for_test(Some(0));
+    let count=Rc::new(Cell::new(0));enqueue(&mut pa,10,1,0,&count);enqueue(&mut pa,10,2,400_000_000,&count);
+    assert_eq!(pump_app_source(&mut pa,super::super::vclock_ms()),AppSourceStatus::Failed);
+    assert_eq!(app_source_seek_status(&mut pa,ticket),AppSourceSeekStatus::ReloadRequired);assert_eq!(ffi_host::seek_log_for_test(),vec![0]);
+    app_source_native_event(epoch,0,999_000_000);assert_eq!(app_source_metrics().frames,0);
+    assert_eq!(ffi_host::flush_calls_for_test(),0);assert_eq!(ffi_host::segment_calls_for_test(),0);
+    assert!(stop_app_source(&mut pa,10));assert_eq!(count.get(),2);ffi_host::force_clocksink_for_test(false);
+}
+
+#[test]
+fn app_seek_refuses_loading_stale_and_invalid_tickets_without_native_calls() {
+    let _g=plx_base::testlock::serial();let mut pa=fresh();start_app_source(&mut pa,config(1)).unwrap();
+    assert_eq!(begin_app_source_seek(&mut pa,1,2),Err(AppSourceSeekError::NotReady));ready(&mut pa);assert!(stop_app_source(&mut pa,1));
+    let mut pa=fresh();running_app_source(&mut pa,3);
+    assert_eq!(begin_app_source_seek(&mut pa,2,4),Err(AppSourceSeekError::Invalid));
+    assert_eq!(begin_app_source_seek(&mut pa,3,3),Err(AppSourceSeekError::Invalid));
+    let ticket=begin_app_source_seek(&mut pa,3,4).unwrap();
+    assert_eq!(commit_app_source_seek(&mut pa,ticket,0),Err(AppSourceSeekError::Invalid));
+    assert_eq!(commit_app_source_seek(&mut pa,ticket,i64::MAX),Err(AppSourceSeekError::Invalid));
+    assert!(ffi_host::seek_log_for_test().is_empty());assert!(stop_app_source(&mut pa,3));
+    assert_eq!(app_source_seek_status(&mut pa,ticket),AppSourceSeekStatus::Stale);
+    assert_eq!(commit_app_source_seek(&mut pa,ticket,1_000_000_000),Err(AppSourceSeekError::Invalid));
+    ffi_host::force_clocksink_for_test(false);
+}
+
+#[test]
+fn app_seek_repeats_in_one_epoch_and_only_current_source_eof_reopens_eos() {
+    let _g=plx_base::testlock::serial();let mut pa=fresh();let epoch=running_app_source(&mut pa,1);
+    let mut previous=None;let count=Rc::new(Cell::new(0));
+    for generation in [2,3] {
+        let ticket=begin_app_source_seek(&mut pa,generation-1,generation).unwrap();
+        if let Some(old)=previous {
+            assert_eq!(app_source_seek_status(&mut pa,old),AppSourceSeekStatus::Stale);
+            assert!(!abort_app_source_seek(&mut pa,old));
+            assert_eq!(commit_app_source_seek(&mut pa,old,10_000_000_000),Err(AppSourceSeekError::Invalid));
+        }
+        commit_app_source_seek(&mut pa,ticket,10_000_000_000).unwrap();
+        enqueue(&mut pa,generation,1,0,&count);enqueue(&mut pa,generation,1,700_000_000,&count);
+        enqueue(&mut pa,generation,2,400_000_000,&count);pump_app_source(&mut pa,super::super::vclock_ms());
+        app_source_native_event(epoch,0,400_000_000);app_source_native_event(epoch,28,0);
+        assert_eq!(app_source_metrics().eos,0);assert_eq!(app_source_seek_status(&mut pa,ticket),AppSourceSeekStatus::Ready);
+        assert_eq!(pa.engine().unwrap().native_epoch,epoch);previous=Some(ticket);
+    }
+    assert_eq!(count.get(),6);assert_eq!(ffi_host::seek_log_for_test(),vec![0,0]);
+    assert!(app_source_eof(&mut pa,3,1));pump_app_source(&mut pa,super::super::vclock_ms());
+    assert!(!pa.engine().unwrap().eos_pushed); // both app lanes must actually finish
+    assert!(app_source_eof(&mut pa,3,2));pump_app_source(&mut pa,super::super::vclock_ms());
+    assert!(pa.engine().unwrap().eos_pushed);app_source_native_event(epoch,28,0);
+    assert_eq!(pump_app_source(&mut pa,super::super::vclock_ms()),AppSourceStatus::Ended);
+    assert!(stop_app_source(&mut pa,3));
+    start_app_source(&mut pa,config(4)).unwrap();ready(&mut pa);
+    assert_eq!(app_source_seek_status(&mut pa,previous.unwrap()),AppSourceSeekStatus::Stale);
+    assert!(stop_app_source(&mut pa,4));ffi_host::force_clocksink_for_test(false);
+}
+
+#[test]
+fn app_seek_pause_refusal_fatal_error_and_stop_preserve_real_ownership() {
+    let _g=plx_base::testlock::serial();let mut pa=fresh();let epoch=running_app_source(&mut pa,1);
+    let count=Rc::new(Cell::new(0));enqueue(&mut pa,1,1,2_000_000_000,&count);
+    ffi_host::force_pause_result_for_test(Some(0));
+    assert_eq!(begin_app_source_seek(&mut pa,1,2),Err(AppSourceSeekError::ReloadRequired));
+    assert_eq!(count.get(),0);assert!(ffi_host::seek_log_for_test().is_empty());
+    assert_eq!(pump_app_source(&mut pa,super::super::vclock_ms()),AppSourceStatus::Failed);
+    assert!(!stop_app_source(&mut pa,2));assert!(stop_app_source(&mut pa,1));assert_eq!(count.get(),1);
+    ffi_host::force_pause_result_for_test(None);
+    let mut pa=fresh();let next_epoch=running_app_source(&mut pa,3);
+    let ticket=begin_app_source_seek(&mut pa,3,4).unwrap();
+    app_source_native_event(epoch,18,101);assert_eq!(app_source_seek_status(&mut pa,ticket),AppSourceSeekStatus::Preparing);
+    app_source_native_event(next_epoch,18,101);assert_eq!(app_source_seek_status(&mut pa,ticket),AppSourceSeekStatus::Failed);
+    assert_eq!(commit_app_source_seek(&mut pa,ticket,10_000_000_000),Err(AppSourceSeekError::ReloadRequired));
+    assert!(stop_app_source(&mut pa,3));
+    let mut pa=fresh();running_app_source(&mut pa,5);let ticket=begin_app_source_seek(&mut pa,5,6).unwrap();
+    commit_app_source_seek(&mut pa,ticket,10_000_000_000).unwrap();
+    let count=Rc::new(Cell::new(0));enqueue(&mut pa,6,1,0,&count);enqueue(&mut pa,6,2,400_000_000,&count);
+    assert!(!stop_app_source(&mut pa,5));assert!(stop_app_source(&mut pa,6));assert_eq!(count.get(),2);
+    assert_eq!(app_source_seek_status(&mut pa,ticket),AppSourceSeekStatus::Stale);ffi_host::force_clocksink_for_test(false);
 }
 fn config(generation: u64) -> AppSourceStart {
     AppSourceStart { generation, payload: std::ffi::CString::new(r#"{"args":[{"option":{"appId":"com.linas.nativeaccountprobe","externalStreamingInfo":{"svpVersion":30},"drm":{"type":"WIDEVINE_MODULAR"}}}]}"#).unwrap(),

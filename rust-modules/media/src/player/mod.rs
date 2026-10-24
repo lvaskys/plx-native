@@ -2201,6 +2201,7 @@ pub extern "C" fn sf_on_event(epoch: c_uint, ty: c_int, num: i64, s: *const c_ch
         // through the device-proven callback-context overload of StarfishMediaAPIs::Load.
         let class = match ty {
             0 => shared::NativeEventClass::Presentation,
+            28 => shared::NativeEventClass::MediaEnd,
             23 => shared::NativeEventClass::UnloadCompleted,
             _ => shared::NativeEventClass::Other,
         };
