@@ -149,7 +149,7 @@ pub enum Knob {
 /// differently: the player route from its own scrub gesture, seek target and focus ring
 /// (the caller’s live-state resolver), and the detail page's full-trailer transport from a preview session that
 /// has none of the three.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Playbar {
     /// the DISPLAYED playhead (a seek target, a scrub preview or the published position)
     pub pos_ns: i64,
@@ -159,6 +159,8 @@ pub struct Playbar {
     pub mark: TransportMark,
     /// drives the inline spinner's rotation
     pub now: u32,
+    /// Crossfade from the resting to the grown scrub clock (zero when inactive).
+    pub clock_grow: f32,
 }
 
 /// The playbar: scrubber, playhead knob, elapsed/remaining clocks and the state read-out. The
@@ -192,7 +194,7 @@ pub fn draw_playbar(p: Painter, bar: Playbar, measure: &dyn plx_machine::machine
     let hx = sx + fw;
     let cy = sy + sh * 0.5;
     if bar.knob == Knob::Focused {
-        let glow = theme::white(0.22);
+        let glow = [1.0f32, 1.0, 1.0, 0.22];
         p.rect(
             Rect::new(hx - 17.0, cy - 17.0, 34.0, 34.0),
             17.0,
@@ -228,17 +230,18 @@ pub fn draw_playbar(p: Painter, bar: Playbar, measure: &dyn plx_machine::machine
     // elapsed under the playhead (':' centered on the knob, clamped to the bar); remaining at the
     // right — hidden once the moving elapsed label would overlap it (near the end of the movie).
     let ty = sy + 30.0;
-    let (el_l, el_r) = draw_clock(
-        p,
-        &fmt_time(dispos, false),
-        hx,
-        ty,
-        theme::size::CAPTION,
-        white,
-        sx,
-        sx + sw,
-        measure,
-    );
+    // A grown knob clock keeps its BASELINE, so it grows upward and never into the remaining clock's
+    // line. It is a CROSSFADE of two ladder rungs (the resting CAPTION and the one above it), each
+    // laid out at its own size, never a tweened size or a scaled texture; the extents the rest of
+    // the line clears are the union of the faces drawn.
+    let elapsed = fmt_time(dispos, false);
+    let (mut el_l, mut el_r) = (f32::INFINITY, f32::NEG_INFINITY);
+    for (sz, face_a) in clock_faces(theme::size::CAPTION, bar.clock_grow).into_iter().flatten() {
+        let ety = plx_gfx::text::baseline_y(sz, 1, theme::size::CAPTION, 1, ty);
+        let (l, r) = draw_clock(p.alpha(face_a), &elapsed, hx, ety, sz, white, sx, sx + sw, measure);
+        el_l = el_l.min(l);
+        el_r = el_r.max(r);
+    }
     let rem = fmt_time(dur - dispos, true);
     // MEASURE the label, never estimate it. `chars * CAPTION * 0.52` was an Arial-calibrated
     // constant guarding a real behaviour — the remaining clock hides before the moving elapsed
@@ -262,7 +265,7 @@ pub fn draw_playbar(p: Painter, bar: Playbar, measure: &dyn plx_machine::machine
         }
     }
     // transport state indicator just past the elapsed clock — the four-state READ-OUT resolved by
-    // the caller’s state resolver (rewind / pause / fast-forward / play, plus the narrowed spinner), and
+    // [`transport_mark`] (rewind / pause / fast-forward / play, plus the narrowed spinner), and
     // NOTHING while playing steadily. A read-out, not an action toggle: nothing here is focusable
     // or hit-tested, and the control row stays the three discs it has always been.
     // Gated on `busy`, not on `loading()`: with `loading()` the transport lit the same spinner the
@@ -298,9 +301,10 @@ pub fn draw_playbar(p: Painter, bar: Playbar, measure: &dyn plx_machine::machine
         };
         let ink = glyph.map_or((0.0, 1.0), crate::icons::ink_x);
         let icy = ty + plx_gfx::text::text_height(theme::size::CAPTION, 1) * 0.5; // vertical center of the clock line
-                                                                                  // scaled so every member of the family lands the SAME height of ink in this one box
+                                                                                // scaled so every member of the family lands the SAME height of ink in this one box
         let bs = glyph.map_or(isz, |g| {
-            isz * crate::icons::band(crate::icons::Icon::Pause) / crate::icons::band(g)
+            isz * crate::icons::band(crate::icons::Icon::Pause)
+                / crate::icons::band(g)
         });
         // **Rewind sits to the LEFT of the clock; everything else to the right.** The mark points
         // the way the playhead is travelling, so `<<` after the time would point back at the number
@@ -317,7 +321,9 @@ pub fn draw_playbar(p: Painter, bar: Playbar, measure: &dyn plx_machine::machine
             el_r + GAP - ink.0 * bs
         };
         match glyph {
-            Some(id) => crate::icons::draw(p, id, Rect::new(bx, icy - bs * 0.5, bs, bs), white),
+            Some(id) => {
+                crate::icons::draw(p, id, Rect::new(bx, icy - bs * 0.5, bs, bs), white)
+            }
             // placeholder-exempt: the transport's inline busy mark on a button (R_INLINE), reported by the playback pipeline, not a content stand-in
             None => Spinner::new(bx + isz * 0.5, icy, Spinner::R_INLINE)
                 .phase(now)
@@ -375,10 +381,18 @@ mod tests {
                 knob: Knob::Tick,
                 mark: TransportMark::None,
                 now: 0,
+                clock_grow: 0.0,
             },
             &measure,
         );
         assert_eq!(fmt_time(83_400_000_000, false), "1:23");
         assert_eq!(fmt_time(36_600_000_000, true), "-0:36");
     }
+}
+
+/// The shared transport clock crossfades two fixed type-scale rungs.
+pub const CLOCK_GROWN_SZ: i32 = theme::size::BODY;
+pub fn clock_faces(base: i32, grow: f32) -> [Option<(i32, f32)>; 2] {
+    let g = grow.clamp(0.0, 1.0);
+    [(g < 1.0).then_some((base, 1.0 - g)), (g > 0.0).then_some((CLOCK_GROWN_SZ, g))]
 }

@@ -214,6 +214,7 @@ mod tests {
 
     #[test]
     fn a_cancel_mid_flight_cannot_be_overtaken_by_an_in_flight_success() {
+        let _serial = plx_base::testlock::serial();
         let mut rig = rig(stored(false));
         let mut d = Dispatcher::<AppHost>::new();
         let mut records = waiting(&mut rig, &mut d);
@@ -252,7 +253,7 @@ mod tests {
             owned: true, ..Default::default()
         });
         let mut rig = rig(saved);
-        // Legacy admission used 32 slots; the real registry bounds requests to MAX_SERVERS (16).
+        // Legacy admission used 32 slots; the registry has no slot-count ceiling any more.
         let sid = plx_plex::plex::ServerId::from_raw(15);
         rig.session_adapter.fixture_resources().endpoints.insert(
             sid.raw(),

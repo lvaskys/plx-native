@@ -39,6 +39,7 @@
 //! before this module. Misreading the table must degrade to yesterday's behavior, not invent a
 //! weaker television: the issue-#22 lesson cuts both ways, and a client that suddenly transcodes
 //! everything on a healthy 4K panel is as wrong as one that direct-plays HEVC to a SoC without it.
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 pub mod dv;
@@ -94,6 +95,12 @@ pub struct Caps {
     /// The VP9 row's (max width, max height, ceil max frame rate), MIN-merged across duplicate
     /// rows; 0 = not stated. Read only when `vp9`.
     pub vp9_row: (u32, u32, u32),
+    /// The deepest VP9 bit depth the profile claims: 10 where a 10-bit VP9 stream has been measured
+    /// to decode with the right levels AND to reach HDR when its container says PQ, 8 everywhere
+    /// else (the table has no bit-depth axis, so this is device evidence, not table data). Only the
+    /// webOS 4 family (ACB video path) is measured, so [`vp9_bit_depth_for`] is the one place the
+    /// 10 comes from; the assumed profile and a table read on any other set say 8.
+    pub vp9_bit_depth: u32,
     /// The device table lists an AV1 decoder row. False in `assumed()` and on every table without
     /// the row, which keeps AV1 a server transcode there. Issue #593.
     pub av1: bool,
@@ -103,7 +110,8 @@ pub struct Caps {
     /// The direct-playable AUDIO subset: [`DP_AUDIO_CODECS`] (what the pipeline decodes)
     /// intersected with the table's audio rows, in `DP_AUDIO_CODECS`'s own URL form/order.
     /// Normal routing reads this and the channel ceilings through `plex::is_dp_audio_track`,
-    /// as does its PMS profile. Forced mode uses the software feed set independently.
+    /// as does its PMS profile. Forced mode starts from the pipeline's feed set with no channel
+    /// ceiling and admits DTS only with a DTS row in `audio_channels` (`Caps::forced_feeds_audio`).
     pub audio: String,
     /// Nonzero, per-codec channel ceilings from the device table, duplicate rows MIN-merged.
     /// Missing legacy limits remain unknown; DTS is admitted only with a measured limit.
@@ -122,6 +130,7 @@ impl Caps {
             hevc_row: (0, 0, 0),
             vp9: false,
             vp9_row: (0, 0, 0),
+            vp9_bit_depth: 8,
             av1: false,
             av1_row: (0, 0, 0),
             audio: "aac,ac3,eac3".to_string(),
@@ -129,20 +138,41 @@ impl Caps {
         }
     }
 
-    /// Membership test on [`Caps::audio`] — `codec` already lowercase (PMS codec ids are).
+    /// Membership test on [`Caps::audio`]. `codec` is any spelling of the name
+    /// ([`audio_codec_id`]): PMS says `dca` where the table and the pipeline say `dts`.
     pub fn audio_has(&self, codec: &str) -> bool {
-        self.audio.split(',').any(|c| c == codec)
+        let id = audio_codec_id(codec);
+        self.audio.split(',').any(|c| c == id)
     }
 
     /// Local counterpart of the profile's codec-scoped audio.channels limitations.
     pub fn audio_supports(&self, codec: &str, channels: i64) -> bool {
-        if !self.audio_has(codec) {
+        let id = audio_codec_id(codec);
+        if !self.audio_has(&id) {
             return false;
         }
-        match self.audio_channels.get(codec) {
-            Some(&limit) => (channels > 0 || codec != "dts") && channels <= i64::from(limit),
-            None => codec != "dts",
+        match self.audio_channels.get(id.as_ref()) {
+            Some(&limit) => (channels > 0 || id != "dts") && channels <= i64::from(limit),
+            None => id != "dts",
         }
+    }
+
+    /// Force Direct Play's audio gate: the pipeline's feed formats ([`DP_AUDIO_CODECS`]), with
+    /// no channel ceiling. DTS additionally needs the evidence Auto asks for
+    /// ([`Caps::forced_admits_dts`]). The planner and the forced profile both read this.
+    pub fn forced_feeds_audio(&self, codec: &str) -> bool {
+        let id = audio_codec_id(codec);
+        if id == "dts" {
+            return self.forced_admits_dts();
+        }
+        DP_AUDIO_CODECS.split(',').any(|c| c == id)
+    }
+
+    /// The Forced-mode DTS rule, one predicate so the owner can flip it: the table has a DTS
+    /// row with a stated channel count (an absent decoder would hang the Load like #584 instead
+    /// of refusing). The channel ceiling itself is not applied.
+    pub fn forced_admits_dts(&self) -> bool {
+        self.audio_channels.contains_key("dts")
     }
 
     /// The transcode-target chain's HEAD — the codec the profile asks PMS to ENCODE when a
@@ -181,7 +211,51 @@ static MEASURED: OnceLock<bool> = OnceLock::new();
 /// What this device decodes. Falls back to [`Caps::assumed`] if [`probe`] has not run — the
 /// boot calls it first, so that path exists for host tests, not the TV.
 pub fn caps() -> &'static Caps {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(caps) = THREAD_CAPS.with(std::cell::Cell::get) {
+        return caps;
+    }
     CAPS.get_or_init(Caps::assumed)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static THREAD_CAPS: std::cell::Cell<Option<&'static Caps>> = const { std::cell::Cell::new(None) };
+}
+
+/// Make [`caps`] answer `caps` on THIS test thread until the guard drops (the
+/// `i18n::language_on_this_thread_for_test` precedent). Tests run in parallel and the
+/// process-wide snapshot is write-once, so a thread-local door is how one test plays a set whose
+/// table lists a DTS decoder. The snapshot is leaked: a test-only cost.
+#[cfg(any(test, feature = "test-support"))]
+pub fn caps_on_this_thread_for_test(caps: Caps) -> CapsGuard {
+    let caps: &'static Caps = Box::leak(Box::new(caps));
+    CapsGuard(THREAD_CAPS.with(|slot| slot.replace(Some(caps))))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct CapsGuard(Option<&'static Caps>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for CapsGuard {
+    fn drop(&mut self) {
+        THREAD_CAPS.with(|slot| slot.set(self.0));
+    }
+}
+
+/// The one canonical spelling of an AUDIO codec name, for every comparison between vocabularies:
+/// lowercase, PMS's `dca` is the pipeline's `dts`, and `ec-3` is `eac3`. Applied at membership
+/// ([`Caps::audio_has`]) and at the Load payload; inbound data stays raw (track memory compares
+/// the raw string).
+pub fn audio_codec_id(codec: &str) -> Cow<'_, str> {
+    if codec.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Cow::Owned(audio_codec_id(&codec.to_ascii_lowercase()).into_owned());
+    }
+    match codec {
+        "dca" => Cow::Borrowed("dts"),
+        "ec-3" => Cow::Borrowed("eac3"),
+        _ => Cow::Borrowed(codec),
+    }
 }
 
 /// One codec name, canonicalized: the table writes `"H.264"`, `"H.265"`, `"HEVC"`, `"EAC3"`;
@@ -337,11 +411,26 @@ fn parse(s: &str) -> Option<Caps> {
         },
         vp9,
         vp9_row: (vp9_wh.0, vp9_wh.1, vp9_fps),
+        vp9_bit_depth: 8,
         av1,
         av1_row: (av1_wh.0, av1_wh.1, av1_fps),
         audio,
         audio_channels,
     })
+}
+
+/// The VP9 bit depth to claim on a set running webOS `major` (0 = unknown). 10 on webOS 1 to 4, the
+/// ACB video path, where the dev set (4.x) decoded a 10-bit Profile 2 stream with correct levels and a
+/// PQ-tagged one switched the panel to HDR through `player::vp9_hdr`. 8 on every other set: on webOS 5+
+/// there is no ACB, so `vp9_hdr` sends nothing, and whether a PQ VP9 stream reaches HDR there is
+/// unknown, which means a 10-bit file might direct-play with washed-out colour where the server
+/// would have converted it correctly.
+pub fn vp9_bit_depth_for(major: u32) -> u32 {
+    if (1..=4).contains(&major) {
+        10
+    } else {
+        8
+    }
 }
 
 /// Read the table once and log what was derived. Called at boot right after `webos::probe`,
@@ -362,8 +451,10 @@ pub fn probe() {
                 } else {
                     String::new()
                 };
+                let mut c = c;
+                c.vp9_bit_depth = vp9_bit_depth_for(crate::tv::device::info().major);
                 plx_base::eventlog::log(&format!(
-                    "devcaps: hevc={} {}x{} vp9={} av1={} audio={} rows: h264={}x{}@{} hevc={}x{}@{}{vp9_row}{av1_row} (device table)",
+                    "devcaps: hevc={} {}x{} vp9={} av1={} audio={} rows: h264={}x{}@{} hevc={}x{}@{}{vp9_row}{av1_row} vp9bits={} (device table)",
                     c.hevc,
                     c.hevc_max.0,
                     c.hevc_max.1,
@@ -375,7 +466,8 @@ pub fn probe() {
                     c.h264_row.2,
                     c.hevc_row.0,
                     c.hevc_row.1,
-                    c.hevc_row.2
+                    c.hevc_row.2,
+                    c.vp9_bit_depth
                 ));
                 c
             }
@@ -514,6 +606,39 @@ mod tests {
         // FLAC/MPEG are in the table but not in the pipeline's decode set; the subset keeps
         // DP_AUDIO_CODECS's own order, not the table's.
         assert_eq!(c.audio, "aac,ac3,eac3,dts");
+    }
+
+    /// PMS names DTS `dca` (every DTS entry in the profiles shipped with PMS spells it so); the
+    /// pipeline and the device table say `dts`. Both spellings must reach the same answer.
+    #[test]
+    fn pms_spelling_dca_is_dts_for_membership_and_channel_bounds() {
+        let caps = parse(REAL).unwrap();
+        assert!(caps.audio_supports("dca", 6));
+        assert!(!caps.audio_supports("dca", 8));
+        assert!(!caps.audio_supports("dca", 0));
+        assert!(caps.audio_supports("DCA", 6), "case folds too");
+        assert!(caps.audio_supports("ec-3", 8), "ec-3 is eac3");
+        assert!(!Caps::assumed().audio_has("dca"));
+        assert_eq!(audio_codec_id("DCA"), "dts");
+        assert_eq!(audio_codec_id("AC3"), "ac3");
+    }
+
+    /// Forced mode admits DTS only on table evidence (a DTS row with channels), but skips the
+    /// channel ceiling: 7.1 DTS-HD MA is refused in Auto and admitted in Forced.
+    #[test]
+    fn forced_dts_needs_a_table_row_but_no_channel_ceiling() {
+        let caps = parse(REAL).unwrap();
+        assert!(caps.forced_feeds_audio("dca"));
+        assert!(caps.forced_feeds_audio("dts"));
+        assert!(!caps.audio_supports("dca", 8));
+        assert!(!Caps::assumed().forced_feeds_audio("dca"));
+        assert!(!Caps::assumed().forced_feeds_audio("dts"));
+        let no_row = parse(&REAL.replace("DTS", "WMA")).unwrap();
+        assert!(!no_row.forced_feeds_audio("dca"));
+        for c in ["aac", "ac3", "eac3", "EAC3"] {
+            assert!(Caps::assumed().forced_feeds_audio(c), "{c}");
+        }
+        assert!(!Caps::assumed().forced_feeds_audio("truehd"));
     }
 
     #[test]
@@ -747,5 +872,20 @@ mod tests {
         let c = Caps::assumed();
         assert!(!c.vp9);
         assert_eq!(c.vp9_row, (0, 0, 0));
+    }
+
+    /// 10-bit VP9 is claimed only on the webOS 4 family (the ACB path it was measured on); an unknown
+    /// release, webOS 5+ and the assumed profile all say 8.
+    #[test]
+    fn vp9_bit_depth_is_ten_only_where_it_was_measured() {
+        assert_eq!(vp9_bit_depth_for(0), 8, "unknown release");
+        for major in 1..=4 {
+            assert_eq!(vp9_bit_depth_for(major), 10, "webOS {major}");
+        }
+        for major in [5, 6, 7, 8, 9, 10, 11, 25] {
+            assert_eq!(vp9_bit_depth_for(major), 8, "webOS {major}");
+        }
+        assert_eq!(Caps::assumed().vp9_bit_depth, 8);
+        assert_eq!(parse(REAL).unwrap().vp9_bit_depth, 8, "parse() alone never claims it; probe() sets it");
     }
 }

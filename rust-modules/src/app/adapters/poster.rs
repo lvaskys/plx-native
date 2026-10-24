@@ -51,6 +51,7 @@ use plx_plex::plex::ServerId;
 use plx_machine::machine::PosterKey;
 use plx_ui::tex::{self, Decoded, PosterError, PosterReady, Tex, Uploader, Warm};
 use std::os::raw::{c_int, c_uchar, c_uint};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -507,7 +508,10 @@ fn set_key(s: &mut Pslot, key: &str) {
 // (server, path, w, h, png) → built transcode path, memoised. resolve_tex_wh_on re-derives the key for
 // every visible art tile every frame (~25-40 tiles × 60fps); the QueryBuilder + token clone behind
 // image_transcode_path was ~15k heap allocs/sec of steady-state waste for keys that never change.
-// MAIN-thread only (all poster_key callers are draw paths).
+// A `thread_local!`, not a `static mut`: only the thread that paints reads it (every `built_key`
+// caller is a draw or prefetch path), and a memo that owns `HashMap`s and `String`s must not be
+// one process-wide value that two threads replace and free under each other. `cargo test` runs
+// tests on parallel threads, which is how `plx_ui`'s tab labels crashed the same way (2026-10-20).
 //
 // The SERVER is part of the key and the token generation is part of the VALUE. Both matter, and
 // neither is bookkeeping: the built path carries a token, so keying without the server would let
@@ -525,8 +529,9 @@ fn set_key(s: &mut Pslot, key: &str) {
 /// already built the same string. Nesting keeps the hit path allocation-free (`get` borrows a
 /// `&str`) and pays for the owned key only on a real miss.
 type MemoDims = (u16, c_int, c_int, bool);
+#[derive(Default)]
 struct KeyMemo {
-    map: std::collections::HashMap<MemoDims, std::collections::HashMap<String, (u32, String)>>,
+    map: std::collections::HashMap<MemoDims, std::collections::HashMap<String, (u32, Rc<str>)>>,
 }
 /// Entries kept before the memo is emptied wholesale. A ceiling, not a working set: a screen's
 /// live keys are dozens, and this only bounds a session that browses thousands of tiles.
@@ -536,7 +541,9 @@ impl KeyMemo {
     /// The memo's whole rule, as a pure function of what it holds — so the two ways it can serve
     /// the wrong path are host-testable without a registry, a socket or a GL context: an entry
     /// belongs to ONE server, and it survives only as long as the token generation it was built
-    /// at. `build` is called exactly when neither holds.
+    /// at. `build` is called exactly when neither holds. The value is an `Rc<str>` so a hit hands
+    /// out a reference count rather than a borrow (which could not leave the thread-local) or a
+    /// fresh `String` (which is the allocation the nesting above exists to avoid).
     fn get_or_build(
         &mut self,
         srv: u16,
@@ -546,32 +553,36 @@ impl KeyMemo {
         png: bool,
         gen: u32,
         build: impl FnOnce() -> String,
-    ) -> &str {
+    ) -> Rc<str> {
         let by_path = self.map.entry((srv, w, h, png)).or_default();
         // Bound the working set the same way the flat map did, one dimension bucket at a time.
         if by_path.len() > MEMO_CAP {
             by_path.clear();
         }
         // HIT: borrow the path, allocate nothing. This is the frame-rate path.
-        if by_path.get(path).is_some_and(|e| e.0 == gen) {
-            return &by_path[path].1;
+        if let Some(e) = by_path.get(path).filter(|e| e.0 == gen) {
+            return Rc::clone(&e.1);
         }
         // MISS (or a moved token): now the owned key is worth paying for.
-        by_path.insert(path.to_owned(), (gen, build()));
-        &by_path[path].1
+        let built: Rc<str> = build().into();
+        by_path.insert(path.to_owned(), (gen, Rc::clone(&built)));
+        built
     }
 }
-static mut KEY_MEMO: Option<KeyMemo> = None;
+thread_local! {
+    static KEY_MEMO: std::cell::RefCell<KeyMemo> = std::cell::RefCell::default();
+}
 
-/// The memo is a SECOND crate global, and it outlives `plex::reset_servers_for_test`. Entries are
-/// keyed `(slot, w, h, png)` and every test re-registers at slot 0, so without this a test is
+/// The memo is a SECOND piece of state beside the registry (one per thread, and a thread that runs
+/// several tests, as `--test-threads=1` does, keeps it), and it outlives `plex::reset_servers_for_test`.
+/// Entries are keyed `(slot, w, h, png)` and every test re-registers at slot 0, so without this a test is
 /// served the previous test's path for the same request box. That the key tests pass at all rests
 /// on `Client::new` drawing a process-unique `token_gen` from a monotone sequence — true today,
 /// incidental, and exactly the kind of thing a later simplification (per-server counters from 0)
 /// would break in a way nothing in this module would explain. Reset it explicitly instead.
 #[cfg(test)]
 fn reset_key_memo() {
-    unsafe { *std::ptr::addr_of_mut!(KEY_MEMO) = None };
+    KEY_MEMO.set(KeyMemo::default());
 }
 
 /// Does a poster that is RESIDENT for `sid` before `change` still answer a draw after it? Seeds
@@ -582,7 +593,7 @@ fn reset_key_memo() {
 pub(crate) fn resident_art_survives_for_test(sid: ServerId, change: impl FnOnce()) -> bool {
     const SRC: &str = "/library/metadata/42/thumb";
     reset_key_memo();
-    let before = built_key(sid, SRC, 2, 2, false).expect("a registered server builds a key").to_owned();
+    let before = built_key(sid, SRC, 2, 2, false).expect("a registered server builds a key").to_string();
     {
         let c = plx_plex::plex::client_for(sid).expect("a registered server");
         let mut g = store();
@@ -597,7 +608,6 @@ pub(crate) fn resident_art_survives_for_test(sid: ServerId, change: impl FnOnce(
     }
     change();
     let hit = built_key(sid, SRC, 2, 2, false)
-        .map(|k| k.to_owned())
         .is_some_and(|k| lookup(sid, &k, Touch::Draw).0 == Some(PosterKey(0)));
     store().slots = [Pslot::ZERO; PT_CAP];
     reset_key_memo();
@@ -608,30 +618,33 @@ pub(crate) fn resident_art_survives_for_test(sid: ServerId, change: impl FnOnce(
 /// unknown server, an empty path, or a path the slot array cannot hold ([`KEY_MAX`]: a path that
 /// cannot survive the round trip is worse than no path, since the stored key would never equal
 /// the probe that built it and every frame would claim a fresh slot and evict a real poster).
-/// MAIN thread; borrows the memo, so the key is consumed before the next call.
+/// The calling thread's own memo ([`KEY_MEMO`]); the key comes back as a reference count, so the
+/// memo is not borrowed once this returns.
 ///
 /// Headroom today, worth stating so a future shape can be judged against it: a headshot key
 /// measures ~177 bytes of the 255 (54 fixed + 89 encoded URL + 34 of token), an ordinary relative
 /// thumb ~140.
-fn built_key(srv: ServerId, path: &str, w: c_int, h: c_int, png: bool) -> Option<&'static str> {
+fn built_key(srv: ServerId, path: &str, w: c_int, h: c_int, png: bool) -> Option<Rc<str>> {
     if path.is_empty() {
         return None;
     }
     let c = plx_plex::plex::client_for(srv)?;
-    // SAFETY: main-thread only (every caller is a draw path), and the borrow is consumed by the
-    // caller before the memo can be touched again; the `'static` is that discipline, not a fact.
-    let memo = unsafe {
-        (*std::ptr::addr_of_mut!(KEY_MEMO)).get_or_insert_with(|| KeyMemo {
-            map: std::collections::HashMap::new(),
+    // The memo's `RefCell` is borrowed only for the lookup. `build` runs under that borrow, and
+    // what it calls (`fan::fan_key`, `transcode_request`) is string building on the client: neither
+    // reaches `built_key`, so there is no second borrow to panic on. What they call into is the Plex
+    // client (`composite_parts`, `image_transcode_path`), in `plx_plex`, a layer below this adapter
+    // that cannot name it: `ci/check-module-layers.py` refuses that reference, so a later edit to
+    // the client cannot start calling back into `built_key`. The two poster-local callees are
+    // one-line wrappers over it, which only a reader keeps from growing a call back.
+    let s = KEY_MEMO.with(|memo| {
+        memo.borrow_mut().get_or_build(srv.raw(), path, w, h, png, c.token_gen(), || {
+            // A server-generated collection composite is replaced by the app's baked fan: one
+            // synthetic key per collection and stamp, whatever box the consumer draws it in.
+            if let Some(fan) = fan::fan_key(path) {
+                return fan;
+            }
+            transcode_request(c, path, w, h, png)
         })
-    };
-    let s = memo.get_or_build(srv.raw(), path, w, h, png, c.token_gen(), || {
-        // A server-generated collection composite is replaced by the app's baked fan: one
-        // synthetic key per collection and stamp, whatever box the consumer draws it in.
-        if let Some(fan) = fan::fan_key(path) {
-            return fan;
-        }
-        transcode_request(c, path, w, h, png)
     });
     if s.len() > KEY_MAX {
         warn_key_refused(s.len());
@@ -829,7 +842,7 @@ const LOGO_REQ_H: c_int = 240;
 /// the PREFETCH must warm the exact key the draw will later resolve — `(server, path, w, h, png)`
 /// IS the store key, so a warm at a different size (or against a different server) is a different
 /// slot and buys nothing. `None` for an item with no ratingKey.
-fn logo_key(srv: ServerId, rk: &str) -> Option<&'static str> {
+fn logo_key(srv: ServerId, rk: &str) -> Option<Rc<str>> {
     if rk.is_empty() {
         return None;
     }
@@ -841,7 +854,7 @@ fn logo_key(srv: ServerId, rk: &str) -> Option<&'static str> {
 /// logotype the moment it lands; warming kills that pop the same way it kills the backdrop's.
 fn logo_warm(srv: ServerId, rk: &str) -> Warm {
     logo_key(srv, rk)
-        .map(|k| lookup(srv, k, Touch::Warm).1)
+        .map(|k| lookup(srv, &k, Touch::Warm).1)
         .unwrap_or(Warm::Known)
 }
 
@@ -858,7 +871,7 @@ fn logo_warm(srv: ServerId, rk: &str) -> Warm {
 /// NB it claims a slot even for an item that HAS no logo — the 404 lands as `P_FAILED` and holds it
 /// — so every hero page costs two of the store's [`PT_CAP`] slots, backdrop plus logo.
 fn logo_probe(srv: ServerId, rk: &str) -> Option<PosterKey> {
-    lookup(srv, logo_key(srv, rk)?, Touch::Draw).0
+    lookup(srv, &logo_key(srv, rk)?, Touch::Draw).0
 }
 
 /// Has this item's clearLogo SETTLED as a miss — the server answered with a non-transient
@@ -867,7 +880,18 @@ fn logo_probe(srv: ServerId, rk: &str) -> Option<PosterKey> {
 /// unsent, in flight, parked for a retry, or the pixels are in; the demo-video accounting
 /// (`plx_ui::placeholder`) reads it to tell "will never arrive" from "has not arrived".
 fn logo_failed(srv: ServerId, rk: &str) -> bool {
-    let Some(key_s) = logo_key(srv, rk) else { return false };
+    logo_key(srv, rk).is_some_and(|key_s| settled_failed(srv, &key_s))
+}
+
+/// [`logo_failed`] for any built key: the slot holding `(srv, path, w, h, png)` is `P_FAILED`.
+/// The same pure peek — a key never built, or never requested, has not failed.
+fn art_failed(srv: ServerId, path: &str, w: c_int, h: c_int, png: bool) -> bool {
+    built_key(srv, path, w, h, png).is_some_and(|key_s| settled_failed(srv, &key_s))
+}
+
+/// The scan behind [`logo_failed`] and [`art_failed`]: a `P_FAILED` slot for this exact art,
+/// current under the disk generation and the server's grant.
+fn settled_failed(srv: ServerId, key_s: &str) -> bool {
     let g = store();
     let cache_gen = plx_platform::imgcache::generation();
     let grant_epoch = plx_plex::plex::client_for(srv).map_or(0, |c| c.grant_epoch());
@@ -881,9 +905,19 @@ fn logo_failed(srv: ServerId, rk: &str) -> bool {
 }
 
 /// The slot a miss claims, as a PURE function of what the store looks like: the first EMPTY, else
-/// the least-recently-used SETTLED (`P_READY`/`P_EVICTED`/`P_FAILED`/`P_RETRY`) slot the current
-/// frame has not touched, else `None` — "everything is either in flight or on screen; skip this
-/// request".
+/// the least-recently-used SETTLED (`P_READY`/`P_EVICTED`/`P_FAILED`/`P_RETRY`) slot no draw has
+/// touched for [`WANT_STALE_FRAMES`] frames, else the oldest stale request, else `None` —
+/// "everything is either in flight or on screen; skip this request".
+///
+/// **A slot a draw touched LAST frame is a card on screen, exactly as one touched this frame is**
+/// ([`drawn_recently`]). The per-frame stamp alone protects only the cards drawn BEFORE the miss
+/// in the same frame, and a walk back (up a grid, left along a shelf) draws its arriving cards
+/// first. On a slow server the off-screen slots are all queued requests, so the oldest settled
+/// slot was a poster on screen, about to be drawn: it went back to its placeholder while dozens
+/// of dead requests sat beside it (imgtrace `HIDDEN gap=1f cause=recycled`; 23 such recycles in
+/// one Library walk of `tests/paging_link.py`, each with 38 or more stale requests in the store).
+/// With nothing else to take, the miss waits: a new card stays a placeholder a few frames longer
+/// rather than blank one that had its picture.
 ///
 /// Extracted from [`lookup`] because the PREFETCH's entire safety argument is a claim about this
 /// function — that a warmed slot (LRU age 0, no frame stamp) is always a more attractive victim than
@@ -931,22 +965,30 @@ fn victim(slots: &[Pslot; PT_CAP], frame: c_uint) -> Option<usize> {
     pick
 }
 
-/// How many frames a queued, DRAWN request may go without a draw touching it before [`victim`]
-/// may recycle it for a card that is on screen now. Long enough that a card still on screen (drawn
+/// How many frames a DRAWN slot (a queued request, or a settled picture) may go without a draw
+/// touching it before [`victim`] may recycle it for a card that is on screen now. Long enough that a card still on screen (drawn
 /// every frame) or briefly covered by a menu is never mistaken for a departed one, short enough
 /// that a held scroll's dead requests (about one new card per frame at the fastest) cannot fill
 /// the store's 64 slots.
 const WANT_STALE_FRAMES: c_uint = 8;
 
-/// A settled slot (nothing in flight or queued for it) that was not drawn this frame: the slots
-/// [`victim`] and [`ahead_victim`] may recycle without costing a request.
+/// A settled slot (nothing in flight or queued for it) that is not a card on screen: the slots
+/// [`victim`] and [`ahead_victim`] may recycle without costing a request or a picture in view.
 fn is_settled_victim(s: &Pslot, frame: c_uint) -> bool {
-    matches!(s.state, P_READY | P_FAILED | P_RETRY | P_EVICTED) && s.frame != frame
+    matches!(s.state, P_READY | P_FAILED | P_RETRY | P_EVICTED) && s.frame != frame && !drawn_recently(s, frame)
+}
+
+/// A draw asked for this slot within the last [`WANT_STALE_FRAMES`] frames: its card is on screen
+/// (or left it a moment ago). The one window both rules share, so a slot is either a card in view
+/// (a queued request is live, a picture is kept) or not (both are recyclable). Speculation
+/// (`visible` unset: a warm, a lookahead entry nobody has drawn) never qualifies.
+fn drawn_recently(s: &Pslot, frame: c_uint) -> bool {
+    s.visible && frame.wrapping_sub(s.frame) < WANT_STALE_FRAMES
 }
 
 /// A request a worker has not picked up whose card has not been drawn for [`WANT_STALE_FRAMES`].
 fn want_is_stale(s: &Pslot, frame: c_uint) -> bool {
-    s.state == P_WANT && s.visible && frame.wrapping_sub(s.frame) >= WANT_STALE_FRAMES
+    s.state == P_WANT && s.visible && !drawn_recently(s, frame)
 }
 
 /// **Lookahead** ([`Touch::Ahead`]): the slots a screen's at-rest lookahead may claim, as a PURE
@@ -972,7 +1014,7 @@ fn want_is_stale(s: &Pslot, frame: c_uint) -> bool {
 /// so every clause-3 eviction removes an entry older than the set's newest, and the screen runs
 /// out of older strangers after finitely many. A Draw is unaffected by any of this: [`victim`]
 /// still sees a lookahead slot as an ordinary settled one, so a visible miss always finds a slot
-/// unless every slot is in flight or was drawn this frame.
+/// unless every slot is in flight or a card on screen ([`drawn_recently`]).
 fn ahead_victim(slots: &[Pslot; PT_CAP], frame: c_uint) -> Option<usize> {
     if let Some(i) = (0..PT_CAP).find(|&i| slots[i].state == P_EMPTY) {
         return Some(i);
@@ -1005,9 +1047,10 @@ fn ahead_victim(slots: &[Pslot; PT_CAP], frame: c_uint) -> Option<usize> {
 
 /// The most recently used ordinary slots a lookahead warm may never recycle: the cards on screen.
 ///
-/// This is the ONLY protection the cards on screen have against a lookahead claim. The claim runs
-/// in `prepare`, before any draw of the frame, so no slot carries the current frame's stamp and
-/// [`ahead_victim`]'s "not drawn this frame" test protects nothing; recency does the work, on the
+/// This is the protection the cards on screen have against a lookahead claim that does not rest
+/// on a frame stamp. The claim runs in `prepare`, before any draw of the frame, so no slot carries
+/// the current frame's stamp, and [`drawn_recently`] covers a card only for the few loop turns
+/// after its last draw, which a screen at rest can outlast; recency does the work, on the
 /// premise that the last frame drew the cards on screen and so left them the newest ordinary
 /// slots. That holds only while the protected count covers every card a screen paints at once:
 /// [`tex::ON_SCREEN_ART_MAX`] (the Library: six columns by five partly visible rows, 30, pinned to
@@ -1239,7 +1282,7 @@ fn lookup(srv: ServerId, key_s: &str, touch: Touch) -> (Hit, Warm) {
         trace::outcome("declined_new");
         return (None, Warm::Full);
     }
-    // miss: prefer EMPTY, else LRU-evict a settled slot not used this frame
+    // miss: prefer EMPTY, else LRU-evict a settled slot no card on screen is using
     let chosen = if touch == Touch::Ahead { ahead_victim(&g.slots, g.frame) } else { victim(&g.slots, g.frame) };
     let idx = match chosen {
         Some(i) => i,
@@ -1320,12 +1363,12 @@ impl tex::Source for PosterSource {
         let sid = ServerId::from_raw(srv);
         let key = built_key(sid, path, w, h, png)?;
         if !trace::armed() {
-            return lookup(sid, key, Touch::Draw).0;
+            return lookup(sid, &key, Touch::Draw).0;
         }
         let id = trace::draw_id(srv, path, w, h, png);
         let kid = trace::key_id(srv, key.as_bytes());
         trace::set_current(id);
-        let hit = lookup(sid, key, Touch::Draw).0;
+        let hit = lookup(sid, &key, Touch::Draw).0;
         let gate = match plx_ui::card_motion::verdict() {
             Some(plx_ui::card_motion::Verdict::Unknown) => trace::Gate::Unknown,
             Some(plx_ui::card_motion::Verdict::Moving) => trace::Gate::Moving,
@@ -1346,7 +1389,7 @@ impl tex::Source for PosterSource {
         match built_key(srv, path, w, h, png) {
             Some(k) => {
                 if trace::armed() { trace::set_current(trace::draw_id(srv.raw(), path, w, h, png)); }
-                let r = lookup(srv, k, Touch::Warm).1;
+                let r = lookup(srv, &k, Touch::Warm).1;
                 if trace::armed() { trace::set_current(0); }
                 r
             }
@@ -1358,7 +1401,7 @@ impl tex::Source for PosterSource {
     /// ([`ahead_victim`]), which is what keeps a screenful of lookahead from evicting itself.
     fn warm_ahead(&self, srv: u16, path: &str, w: i32, h: i32, png: bool) -> Warm {
         let srv = ServerId::from_raw(srv);
-        built_key(srv, path, w, h, png).map_or(Warm::Known, |k| lookup(srv, k, Touch::Ahead).1)
+        built_key(srv, path, w, h, png).map_or(Warm::Known, |k| lookup(srv, &k, Touch::Ahead).1)
     }
     fn logo(&self, srv: u16, rk: &str) -> Option<PosterKey> {
         logo_probe(ServerId::from_raw(srv), rk)
@@ -1368,6 +1411,9 @@ impl tex::Source for PosterSource {
     }
     fn logo_failed(&self, srv: u16, rk: &str) -> bool {
         logo_failed(ServerId::from_raw(srv), rk)
+    }
+    fn failed(&self, srv: u16, path: &str, w: i32, h: i32, png: bool) -> bool {
+        art_failed(ServerId::from_raw(srv), path, w, h, png)
     }
     fn unresident(&self, key: PosterKey, refused: bool) {
         let mut g = store();
@@ -1641,6 +1687,28 @@ impl ArtFail {
     }
 }
 
+/// Has this (server, cause) pair been reported before? The first call for a pair answers `true`.
+///
+/// One word of cause bits per server that has FAILED, keyed by its raw id: a server is a registry
+/// slot of any number, and a sign-out never renumbers what registers after it, so a table over the
+/// first sixteen would fold every later server into one word and hide the second of them. Only a
+/// failing server owns an entry, and this path is already one line per pair for the whole process.
+/// A `ServerId::UNSET` (or any id that names nothing) is simply another key, which is what keeps
+/// the lookup total for the store entry points that take a raw key from any caller.
+fn first_failure(srv: ServerId, cause: ArtFail) -> bool {
+    static LOGGED: Mutex<std::collections::BTreeMap<u16, u32>> =
+        Mutex::new(std::collections::BTreeMap::new());
+    let bit = 1u32 << cause as u32;
+    // One lock, not load-then-store: this loop runs on more than one thread (`posters_init` spawns
+    // two), so two workers can reach the same cause for the same server at once and only the one
+    // that flipped the bit may write the line.
+    let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    let word = logged.entry(srv.raw()).or_insert(0);
+    let first = *word & bit == 0;
+    *word |= bit;
+    first
+}
+
 /// A fetch that produced no bytes logs ONCE per (cause, server), then goes quiet.
 ///
 /// **Why it is logged at all.** `img::img_decode_rgba` reports a decode that failed (`img:
@@ -1659,8 +1727,8 @@ impl ArtFail {
 /// **Why the SERVER is half the key.** With a friend's share registered beside our own, the
 /// interesting failure is the asymmetric one — ours answers and the share does not, because it is
 /// asleep or its token was revoked — and a cause-only latch would spend its single line on
-/// whichever failed first and hide the other for the rest of the process. [`plx_plex::plex::MAX_SERVERS`]
-/// is 16, so the extra dimension is one `u32` of bits per slot.
+/// whichever failed first and hide the other for the rest of the process. The extra dimension
+/// is one `u32` of bits per failing server ([`first_failure`]).
 ///
 /// **What is deliberately NOT in the line: the key.** It is a `/photo/:/transcode?…` path ending in
 /// `&X-Plex-Token=…` (see [`poster_key`], and the test that pins the token to the end of it), and
@@ -1670,19 +1738,7 @@ impl ArtFail {
 /// else: not the address, not the machine identifier, not the friendly name (which defaults to the
 /// owner's hostname). `app/diagnostics.rs`'s module doc argues the whole rule for the on-screen read-out.
 fn warn_fetch_failed(srv: ServerId, cause: ArtFail) {
-    // One word per server slot, one BIT per cause. Indexing by the SERVER (clamped) is what keeps
-    // the index in range by construction rather than by assumption: `ServerId::UNSET` is
-    // `u16::MAX`, and the three store entry points take a raw key from any caller, so a slot's id
-    // is not guaranteed to name a registry entry. Everything that does not name one shares the
-    // last word.
-    const NWORD: usize = plx_plex::plex::MAX_SERVERS + 1;
-    static LOGGED: [AtomicU32; NWORD] = [const { AtomicU32::new(0) }; NWORD];
-    let bit = 1u32 << cause as u32;
-    let word = &LOGGED[(srv.raw() as usize).min(plx_plex::plex::MAX_SERVERS)];
-    // fetch_or, not load-then-store: this loop runs on more than one thread (`posters_init` spawns
-    // two), so two workers can reach the same cause for the same server at once and only
-    // the one that flipped the bit may write the line.
-    if word.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+    if first_failure(srv, cause) {
         plx_base::eventlog::log(&format!(
             "posters: art fetch FAILED on server {} - {} (permanent responses are final; transient failures retry with backoff while the tile is on screen; further ones like this are silent)",
             srv.raw(),
@@ -2036,6 +2092,18 @@ mod tests {
     //! `poster_key` only formats a string.
     use super::*;
 
+    /// A failing server owns its own latch whatever its slot number: servers past the first sixteen
+    /// used to share one word, so the second of them never got its line.
+    #[test]
+    fn each_failing_server_is_reported_once_whatever_its_slot() {
+        for raw in [200u16, 201, 4000] {
+            let sid = ServerId::from_raw(raw);
+            assert!(first_failure(sid, ArtFail::NoResponse), "server {raw}'s first failure is reported");
+            assert!(!first_failure(sid, ArtFail::NoResponse), "...once");
+            assert!(first_failure(sid, ArtFail::Empty), "a different cause on the same server is new");
+        }
+    }
+
     #[test]
     fn demand_waits_for_decoded_bytes_in_both_queues_to_drain() {
         let mut slots = [Pslot::ZERO; PT_CAP];
@@ -2091,10 +2159,31 @@ mod tests {
         (Fresh(g), sid, tok)
     }
 
+    /// **The key memo is the calling thread's own.** It owns `HashMap`s and `String`s, and a full
+    /// bucket is cleared (freed) on the next insert, so one process-wide memo lets two threads free
+    /// each other's keys: the class that aborted `plx_ui`'s tests in libmalloc (2026-10-20). Six
+    /// threads build keys for disjoint paths in ONE request box, far past `MEMO_CAP`, so every
+    /// thread clears its bucket again and again; each key must come back carrying its own path.
+    #[test]
+    fn every_thread_builds_its_keys_through_its_own_memo() {
+        const ROUNDS: usize = 3 * MEMO_CAP;
+        let (_fresh, sid, _tok) = one_server();
+        plx_base::testrace::race(6, move |t| {
+            for i in 0..ROUNDS {
+                let path = format!("/library/metadata/{t}{i}/thumb/1");
+                let want = path.replace('/', "%2F");
+                let first = built_key(sid, &path, 250, 375, false).expect("a registered server builds a key");
+                assert!(first.contains(&want), "round {i}: {first}");
+                let again = built_key(sid, &path, 250, 375, false).expect("a registered server builds a key");
+                assert_eq!(first, again, "round {i}: a hit differs");
+            }
+        });
+    }
+
     /// Build a key through the real [`built_key`] — the same call `lookup` makes for a draw —
     /// so these grade the string a draw actually receives, not a reimplementation of it.
     fn key_for(srv: ServerId, src: &str, w: c_int, h: c_int, png: c_int) -> String {
-        built_key(srv, src, w, h, png != 0).unwrap_or("").to_owned()
+        built_key(srv, src, w, h, png != 0).map(|k| k.to_string()).unwrap_or_default()
     }
 
     /// **Search's `Directory[]` half, and the reason this file needed no second image route.** An
@@ -3860,16 +3949,14 @@ mod tests {
     #[test]
     fn a_memo_entry_belongs_to_one_server_and_one_token_generation() {
         const PATH: &str = "/library/metadata/42/thumb/1755000000";
-        let mut m = KeyMemo {
-            map: std::collections::HashMap::new(),
-        };
+        let mut m = KeyMemo::default();
         let builds = std::cell::Cell::new(0u32);
         let key = |m: &mut KeyMemo, srv: u16, w: c_int, gen: u32, built: &str| -> String {
             m.get_or_build(srv, PATH, w, 375, false, gen, || {
                 builds.set(builds.get() + 1);
                 built.to_owned()
             })
-            .to_owned()
+            .to_string()
         };
 
         assert_eq!(key(&mut m, 0, 250, 7, "A?token=a"), "A?token=a");
@@ -4027,6 +4114,86 @@ mod tests {
         );
         drop(g);
         store().slots = [Pslot::ZERO; PT_CAP];
+    }
+
+    /// **A poster that is showing is never the victim.** The shape every held walk on a slow
+    /// server reaches (`tests/paging_link.py`, imgtrace `HIDDEN gap=1f cause=recycled`): the
+    /// requests of rows long gone fill the store, the only settled slots left are the cards on
+    /// screen, and the frame's first miss runs before the draws that would stamp them. A request
+    /// nobody draws goes first; with none, the miss waits ("store full") rather than blank a card.
+    #[test]
+    fn a_miss_recycles_a_dead_request_before_a_poster_drawn_last_frame() {
+        let f: c_uint = 100;
+        let drawn = |use_, frame| Pslot { visible: true, ..ready(use_, frame) };
+        let mut slots: [Pslot; PT_CAP] =
+            std::array::from_fn(|i| want(f - 40, 100 + i as c_uint, true)); // rows that scrolled away
+        for (i, s) in slots.iter_mut().enumerate().take(30) {
+            *s = drawn(1000 + i as c_uint, f - 1); // the screenful the last frame drew
+        }
+        let pick = victim(&slots, f).expect("a dead request is there to recycle");
+        assert_eq!(slots[pick].state, P_WANT, "the miss recycled a poster that was on screen (slot {pick})");
+        assert_eq!(pick, 30, "the request drawn longest ago goes");
+        // Nothing but the screen and the workers' own slots: the newcomer waits a frame.
+        for s in slots.iter_mut().skip(30) {
+            s.state = P_LOADING;
+        }
+        assert_eq!(victim(&slots, f), None, "no picture on screen is given up for a new card");
+        // A card that left the screen is ordinary LRU again once the window has passed.
+        slots[7].frame = f - WANT_STALE_FRAMES;
+        assert_eq!(victim(&slots, f), Some(7));
+        // The lookahead's claim obeys the same rule (it had only recency before).
+        assert_eq!(ahead_victim(&[drawn(5, f - 1); PT_CAP], f), None);
+    }
+
+    /// The same defect through the store itself: a held scroll whose server answers slower than
+    /// the rows pass, walking BACK (up a grid, left along a shelf), so the arriving row is the first
+    /// drawn and its misses run before the rest of the screen is stamped. Whatever arrived and is
+    /// still on screen stays READY on every later frame.
+    #[test]
+    fn a_held_scroll_on_a_slow_server_keeps_every_poster_that_is_showing() {
+        let (_fresh, sid, _) = one_server();
+        {
+            let mut g = store();
+            g.slots = [Pslot::ZERO; PT_CAP];
+            g.frame = 1000;
+        }
+        let key = |n: usize| key_for(sid, &format!("/library/metadata/{}/thumb", 9000 + n), 2, 2, 0);
+        let (cols, rows) = (6usize, 5usize);
+        let mut first_row = 60usize;
+        let mut showing: Vec<usize> = Vec::new(); // card numbers READY when the last frame ended
+        let (mut arrived, mut lost) = (0usize, Vec::new());
+        for frame in 0..400usize {
+            store().frame += 1;
+            if frame % 8 == 0 {
+                first_row -= 1;
+            }
+            let on_screen = first_row * cols..(first_row + rows) * cols;
+            for n in on_screen.clone() {
+                lookup(sid, &key(n), Touch::Draw);
+            }
+            let mut g = store();
+            let is_ready = |g: &Store, n: usize| {
+                let k = key(n);
+                g.slots.iter().any(|s| s.state == P_READY && key_bytes(s) == k.as_bytes())
+            };
+            for &n in showing.iter().filter(|n| on_screen.contains(n)) {
+                if !is_ready(&g, n) {
+                    lost.push((frame, n));
+                }
+            }
+            // The slow server: one picture lands every 4 frames, the worker's own choice of which.
+            if frame % 4 == 0 {
+                if let Some(i) = next_wanted(&g.slots) {
+                    g.slots[i].state = P_READY;
+                    arrived += 1;
+                }
+            }
+            showing = on_screen.clone().filter(|&n| is_ready(&g, n)).collect();
+        }
+        store().slots = [Pslot::ZERO; PT_CAP];
+        assert!(arrived > 50, "the scenario delivered {arrived} pictures");
+        assert!(lost.is_empty(), "{} posters that were showing lost their slot, first (frame, card) {:?}",
+            lost.len(), lost.first());
     }
 
     /// The store's rule for a stale request: last resort only, drawn demand only, never in flight.

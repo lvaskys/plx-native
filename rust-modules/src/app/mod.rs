@@ -113,8 +113,10 @@ pub(crate) use bootstrap::HomeIo;
 /// and `devcaps` — application facts — and because its state is now an `App` field.
 pub(crate) mod diagnostics;
 pub(crate) mod words;
+pub(crate) mod page_title;
 pub(crate) mod clock;
 mod clock_notice;
+mod hint_taught;
 mod recorder;
 mod window_activity;
 pub(crate) mod events;
@@ -124,7 +126,10 @@ mod preferences;
 pub(crate) mod input;
 pub(crate) mod bridge;
 pub(crate) mod chrome;
+mod collections_probe;
 pub(crate) mod content;
+pub(crate) mod deeplink;
+pub(crate) mod reread;
 pub(crate) mod run;
 use self::boot::*;
 use self::events::*;
@@ -147,6 +152,7 @@ extern "C" {
         h: c_int,
         flags: u32,
     ) -> *mut c_void;
+    fn SDL_DestroyWindow(win: *mut c_void);
     fn SDL_GL_CreateContext(win: *mut c_void) -> *mut c_void;
     fn SDL_GL_SetSwapInterval(interval: c_int) -> c_int;
     fn SDL_Delay(ms: u32);
@@ -270,6 +276,9 @@ pub(crate) struct App {
     /// `player::engine::ENGINE` together with the main-thread token that confines it.
     pub(crate) adapters: Adapters,
     repause_at: i64,
+    /// The playing session is parked because the pipeline took its video decoder back, not
+    /// because the app left the screen; the next press restores it (`run::park_on_decoder_release`).
+    decoder_parked: bool,
     pub(crate) ok_armed: bool,
     last_route_reported: &'static str,
     pub(crate) ptr: Pointer,
@@ -285,14 +294,23 @@ pub(crate) struct App {
     /// already finished by then). See `input::menu_play_tick`, driven every frame beside
     /// `pump_detail()` (`app/run.rs`).
     pub(crate) menu_play_await: Option<MenuPlayAwait>,
+    /// A title another app asked to open (`deeplink`), until Home is up to hand it to
+    /// `menu_play_await`.
+    pub(crate) deeplink: deeplink::DeepLink,
     pub(crate) prev: u32,
-    pub(crate) refresh_hubs_at: u32,
-    /// The Detail page a playback returned to, waiting for the stop report to land so it can
-    /// re-read the item (`content::refresh_after_playback`).
-    pub(crate) refresh_detail: Option<plx_data::stores::viewstate::DetailRefresh>,
+    /// A playback exit is owed a re-read of Home's hubs and every library's shelves. Armed by
+    /// `exit_player`; spent by `playback_tick` once the stop's `stopped` POST has landed
+    /// (`route::timeline_stop_landed`) and the player is off the route (never by a timer: a read
+    /// that beats the stop's POST sees the old resume point).
+    pub(crate) refresh_hubs: bool,
+    /// The return from the player to Home waiting on that refetch (`playback::ReturnHold`).
+    pub(crate) return_hold: playback::ReturnHold,
     /// The HTTPS retry for servers on a plaintext grant (`plex::grant::UpgradeRetry`), stepped
     /// every frame beside the view-state pump (`app/run.rs`).
     pub(crate) plaintext_upgrade: plx_plex::plex::grant::UpgradeRetry,
+    /// The re-read of covered pages and of the visible one on resume, stepped once per loop
+    /// iteration beside the view-state pumps (`app/reread.rs`).
+    pub(crate) reread: reread::Reread,
     ev: [u8; 128],
     remote: Option<crate::remote::Remote>,
     /// The SDL window (`SDL_CreateWindow`), for the swap.
@@ -494,6 +512,8 @@ fn pre_boot_diagnostics() -> plx_telemetry::telemetry::native::Guard {
 /// the THREE real phases (pre-boot diagnostics, `boot`, this), never the steps inside any one of them.
 unsafe fn run_and_shutdown(app: &mut App) -> c_int {
     run::run(app);
+    // Quit: the last screen's visit has not been reported, and no route change will.
+    run::end_route_visit(app, false);
     let failed = finish_recording(&mut app.rec, app.bridge.landgate())
         || app.bridge.controlled_failure().is_some();
     app.glass.sources.borrow_mut().clear();

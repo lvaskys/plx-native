@@ -59,8 +59,7 @@ there: everywhere else `RELEASE=1` is still yours to remember.
 
 The one exception, and it is safe to lean on: a **pure query** — any of the
 `print-*` goals, plus the other build-nothing goals (`SIDE_EFFECT_FREE` in the Makefile is the
-source: `QUERY_GOALS`, `release-guard`, `lab-guard`, `disk`, `build-bench*`; transcribing the list
-here is how it went one short the first time it was written) is exempted from that
+list: `grep '^SIDE_EFFECT_FREE' Makefile`; it has gone stale every time someone transcribed it here) is exempted from that
 parse-time deletion, precisely so that asking the Makefile a question mid-release cannot discard the
 binary you are about to publish. Mixing a query with a real goal is not a query and does stamp.
 
@@ -202,7 +201,7 @@ loader check become a playback claim — it grades whether the process starts an
 plane. The note carries one line per tier; the matrix belongs to the audit.
 
 **Look at the screenshots; the release's own run commits them.** The README,
-`docs/ux-scenario.md` and the website's close-up stills and link-preview card (`site/media/`) show
+`docs/ux-scenario.md` and the website's screenshots (`docs/screenshots/`, staged by `pages.yml`) and link-preview card (`site/media/`) show
 the release's own UI, so a release whose figures predate its changes advertises a different app. The `stills` job
 of `site-video.yml` regenerates them after the release (see "Site video" below); this Mac render is a PREVIEW, to
 open the figures and fix any caption they falsify in this release's commit, not to commit the images:

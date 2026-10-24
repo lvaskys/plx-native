@@ -32,6 +32,8 @@ static PORT: plx_platform::tv::Port = plx_platform::tv::Port {
     clear_opaque_region: crate::system::clear_opaque_region,
     pump_bus: crate::system::ls2_pump,
     frame_probe_request: crate::system::frame_probe_request,
+    frame_probe_prepare_begin: crate::system::frame_probe_prepare_begin,
+    frame_probe_prepare_end: crate::system::frame_probe_prepare_end,
     frame_probe_waiting: crate::system::frame_probe_waiting,
     frame_probe_acquired: crate::system::frame_probe_acquired,
     frame_probe_fields: crate::system::frame_probe_fields,
@@ -46,4 +48,18 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
     #[cfg(target_os = "linux")]
     let _ = plx_platform::storage::client::install_activator(plx_platform::webos::activate_storage_helper);
     crate::app::run_application(pms_host, pms_port)
+}
+
+/// `src/main.c` hands over SAM's launch payload (`argv[1]`) before `plex_run`. Kept raw in
+/// `tv::launch`; `app::deeplink` reads it once the app has a session to act in.
+///
+/// # Safety
+/// `json` is NULL or a NUL-terminated string that outlives the call.
+#[no_mangle]
+pub unsafe extern "C" fn plx_launch_args(json: *const c_char) {
+    if json.is_null() {
+        return;
+    }
+    let raw = unsafe { std::ffi::CStr::from_ptr(json) }.to_string_lossy();
+    plx_platform::tv::launch::offer(&raw);
 }

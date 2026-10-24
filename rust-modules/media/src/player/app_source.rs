@@ -89,9 +89,11 @@ pub fn app_source_native_event(epoch: u32, ty: c_int, num: i64) {
             23 => super::super::shared::NativeEventClass::UnloadCompleted,
             _ => super::super::shared::NativeEventClass::Other,
         };
-        SHARED.with_native_session(epoch, class, num, || match ty {
+        SHARED.with_native_session_scoped(epoch, class, num, |scope| {
+            if scope == super::super::shared::EventScope::Release { return; }
+            match ty {
             0 => {
-                super::super::sf_on_event_inner(0, num, std::ptr::null());
+                super::super::sf_on_event_inner(0, num, std::ptr::null(), scope);
                 let elapsed = i64::from(super::super::vclock_ms().wrapping_sub(APP_STARTED.load(Ordering::Acquire)));
                 let _ = APP_FIRST_PICTURE.compare_exchange(-1,elapsed,Ordering::AcqRel,Ordering::Acquire);
             },
@@ -110,6 +112,7 @@ pub fn app_source_native_event(epoch: u32, ty: c_int, num: i64) {
                 SHARED.demux_io_failed.store(true, Ordering::Release);
             },
             _ => {},
+            }
         });
     }));
 }
@@ -183,7 +186,7 @@ pub fn start_app_source(pa: &mut super::super::adapter::PlayerAdapter, start: Ap
     eng.load_th = Some(load);
     // The external adapter has no private in-place-seek policy. Seeking is
     // deliberately absent from this bounded integration entry.
-    super::super::INPLACE_SEEK_OK.store(false, Ordering::Relaxed);
+    super::super::set_seek_mode(super::super::SeekMode::Reload);
     pa.install(eng); native.commit(); clock.commit();
     TX.started.store(true, Ordering::Relaxed);
     Ok(epoch)
@@ -280,7 +283,9 @@ pub fn pump_app_source(pa: &mut super::super::adapter::PlayerAdapter, now: u32) 
 pub fn stop_app_source(pa: &mut super::super::adapter::PlayerAdapter, generation: u64) -> bool {
     if !pa.engine().is_some_and(|eng| owns(eng,generation)) { return false; }
     let mut eng = pa.take().expect("main-thread checked owner");
-    teardown_native_engine(pa,&mut eng,true, |_| {});
+    let mut spans = TeardownSpans::new();
+    let release = teardown_native_engine(pa, &mut eng, true, false, &mut spans, |_| {});
+    debug_assert!(release.is_none());
     SHARED.reset_session(); TX.reset();
     true
 }

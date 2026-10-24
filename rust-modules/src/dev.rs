@@ -66,7 +66,7 @@ pub(crate) mod framedump;
 // `test` as well as the feature: `any_trigger_present` is the only caller and it is cfg'd out of a
 // release build, but the test below asserts this list's contents and runs with default features.
 #[cfg(any(feature = "devtriggers", test))]
-const DIAG: [&str; 37] = [
+const DIAG: [&str; 41] = [
     "plxnative-diag.log",
     "plxnative-events.log",
     "plxnative-stderr.log",
@@ -89,14 +89,18 @@ const DIAG: [&str; 37] = [
     // harness has to be able to observe the who's-watching picker, which a non-DIAG trigger would
     // suppress — the observer would remove the screen it was armed to watch.
     "plxnative-focus",
-    // The two OVERDRAW surfaces and the hero-ground fold ([`plx_gfx::overdraw`],
-    // `docs/backdrop-blur-profiling.md` Part 5). All three are measurement knobs whose whole
+    // `fx=` on Home's fingerprint (the focused card's drawn x) and, on every page that draws a
+    // card section, the `cd*` fields (`plx_ui::card_probe`): a pure observer of `focus`.
+    "plxnative-focusx",
+    // The two OVERDRAW surfaces, the resting-card split's off switch and the hero-ground fold
+    // ([`plx_gfx::overdraw`], `docs/backdrop-blur-profiling.md` Part 5). All four are measurement knobs whose whole
     // method is an A/B against an unmasked control leg — and a non-DIAG trigger suppresses the
     // who's-watching picker, so the control leg and the masked leg would boot to DIFFERENT
     // SCREENS and the difference between them would be the screen, not the class being priced.
     // That is the exact failure this list exists to stop, and it is invisible in the numbers.
     "plxnative-overdraw",
     "plxnative-drawmask",
+    "plxnative-nocardsplit",
     "plxnative-heroground",
     // The FRAME BUDGET's A/B control leg (`ui/frame/budget.rs`, spec §8.1): admission as it was
     // before phase 11 — quota only, no time ceiling, no solo rule. DIAG for exactly the argument
@@ -117,6 +121,9 @@ const DIAG: [&str; 37] = [
     // one is moot — but leaving it out of this list would be a silent inconsistency for the next
     // reader, and the honest reading is that it changes no screen.
     "plxnative-crashtest",
+    // The deliberate FREEZE (`freeze_on_purpose`): it stalls the main loop and changes no screen,
+    // and its whole use is watching the freeze report come back from the screen it froze.
+    "plxnative-freeze",
     // The FRAME-DROP DETECTOR (`app.rs`, the `FRAMEDROP` line and `worstframe=`). It observes the
     // frame it is armed on and changes no screen; the harness's `worst_ceiling_ms` /
     // `stall_ceiling_ms` gates arm it under every fps scene, and a scene whose gate moved the boot
@@ -155,6 +162,9 @@ const DIAG: [&str; 37] = [
     // how an AV1 packet is framed before the decoder sees it, so an on-device comparison of the
     // variants must not move the boot screen out from under the playback being compared.
     "plxnative-av1obu",
+    // Send VP9's sourceInfo envelope as the pipeline made it, without the container-derived HDR10
+    // declaration (`media::player::vp9_hdr`): the A/B for whether the television switches to HDR.
+    "plxnative-novp9hdr",
     // The side subtitle reader (`media::player::subside`): content = the 0-based position of the
     // embedded subtitle stream to draw over a plain remux, read at each playback start.
     "plxnative-subside",
@@ -242,20 +252,19 @@ pub(crate) fn arm_wayland_debug() {}
 /// server".  Keeping the slot in a separate trigger preserves that wire format for the regression
 /// harness while allowing `tv-session --server N` to name the other half explicitly.
 ///
-/// Bounds are checked here rather than left to `ServerId::from_raw`: that constructor also exists
-/// for compact stores and deliberately accepts any `u16`; a hand-written dev trigger must not turn
-/// an arbitrary number into a plausible identity and then silently fall back elsewhere.
+/// Only a number that can name a slot at all is accepted here: `ServerId::from_raw` also builds the
+/// reserved "no server" value from `u16::MAX`, and a hand-written dev trigger must not turn that
+/// into a plausible identity. Whether the slot is REGISTERED is the caller's check
+/// (`boot::direct_trigger_server` asks the registry), so a slot past the first sixteen works as
+/// soon as that many servers exist and a missing one fails closed there.
 #[cfg(any(feature = "devtriggers", test))]
 fn parse_server_slot(s: &str) -> Result<u16, String> {
     let slot = s
         .trim()
         .parse::<u16>()
         .map_err(|_| format!("{s:?} is not a server slot"))?;
-    if (slot as usize) >= plx_plex::plex::MAX_SERVERS {
-        return Err(format!(
-            "server slot {slot} is outside 0..{}",
-            plx_plex::plex::MAX_SERVERS
-        ));
+    if !plx_plex::plex::ServerId::from_raw(slot).is_set() {
+        return Err(format!("server slot {slot} is the reserved no-server value"));
     }
     Ok(slot)
 }
@@ -358,6 +367,52 @@ pub(crate) fn crash_on_purpose() {
 }
 #[cfg(not(feature = "devtriggers"))]
 pub(crate) fn crash_on_purpose() {}
+
+/// **Freeze the main loop on purpose** — `plxnative-freeze=<seconds>` (1 to 120).
+///
+/// The instrument for the freeze probe, as [`crash_on_purpose`] is for the fault tracer: nothing a
+/// person does reliably stalls the loop for five seconds on demand, and a freeze report nobody has
+/// seen arrive is not known to work. Called from the once-a-second heartbeat, so it runs ON the
+/// main thread and the stall is exactly what the watchdog watches; it waits [`FREEZE_AFTER_TICKS`]
+/// beats first, which is how it knows the first present has armed the watchdog.
+///
+/// It reads the trigger ONCE, on that beat (never per frame: a trigger read is a `stat`), and
+/// **removes the file when it fires**, so one arming is one freeze and a relaunch is not frozen
+/// again without being asked. `std::thread::sleep` restarts after `EINTR`, so the probe signal
+/// cannot cut the stall short.
+///
+/// **With the default `threadcheck` feature the developer watchdog is armed**, and it aborts the
+/// process once the main thread has made no progress for `HANG_FATAL_MS` (2 s), well before the 5 s
+/// freeze probe. To see a freeze report come back, write `log` into `/tmp/plxnative-guard` before
+/// launching (that file turns the abort into a log line), or build without `threadcheck`.
+///
+/// **Compiled out of a release build** with the rest of `devtriggers`.
+#[cfg(feature = "devtriggers")]
+pub(crate) fn freeze_on_purpose() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static BEATS: AtomicU32 = AtomicU32::new(0);
+    if BEATS.fetch_add(1, Ordering::Relaxed) != FREEZE_AFTER_TICKS {
+        return;
+    }
+    let Some(text) = plx_base::devtrig::read("freeze") else {
+        return;
+    };
+    let _ = std::fs::remove_file(plx_base::devtrig::path("freeze"));
+    let Ok(secs) = text.parse::<u64>() else {
+        plx_base::eventlog::log(&format!("freezetest: {text:?} is not a number of seconds — not freezing"));
+        return;
+    };
+    let secs = secs.clamp(1, 120);
+    plx_base::eventlog::log(&format!("freezetest: DELIBERATE freeze of the main thread, {secs}s"));
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    plx_base::eventlog::log("freezetest: the deliberate freeze is over");
+}
+#[cfg(not(feature = "devtriggers"))]
+pub(crate) fn freeze_on_purpose() {}
+
+/// Heartbeats to let pass before [`freeze_on_purpose`] looks at its trigger.
+#[cfg(feature = "devtriggers")]
+const FREEZE_AFTER_TICKS: u32 = 8;
 
 /// `plxnative-softfloat`: the ARM half of `plx_machine::motion`'s differential claim (spec §4.2). Runs the
 /// 4,096-operand table through this binary's own arithmetic, logs its hash beside the host's
@@ -830,7 +885,8 @@ mod tests {
     fn server_slot_trigger_accepts_only_a_registry_slot() {
         assert_eq!(super::parse_server_slot("0"), Ok(0));
         assert_eq!(super::parse_server_slot("15"), Ok(15));
-        for invalid in ["", "-1", "16", "1.0", "server-1"] {
+        assert_eq!(super::parse_server_slot("40"), Ok(40));
+        for invalid in ["", "-1", "65535", "65536", "1.0", "server-1"] {
             assert!(
                 super::parse_server_slot(invalid).is_err(),
                 "{invalid:?} must not silently target another server"

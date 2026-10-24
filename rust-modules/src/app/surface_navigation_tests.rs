@@ -3,7 +3,7 @@
 //!
 //! The tests marked `#[cfg(feature = "hostsim")]` below (the item-menu opener-lift ones) run ONLY
 //! with that feature: `make test-crate C=app T=<filter>` filters them out and exits 0. Run them with
-//! `CARGO_INCREMENTAL=0 PATH="$HOME/.cargo/bin:$PATH" cargo +nightly test --lib -p plxnative-modules --features hostsim -- <filter>`
+//! `CARGO_INCREMENTAL=0 PATH="$HOME/.cargo/bin:$PATH" cargo test --lib -p plxnative-modules --features hostsim -- <filter>`
 //! from `rust-modules/`.
 
 use super::*;
@@ -27,7 +27,7 @@ fn content_instances_compare_item_identity_and_keep_distinct_entries() {
 #[test]
 fn a_page_arg_wears_the_chrome_its_own_table_says() {
     for r in every_route() {
-        let want = if matches!(r, AppArg::Home | AppArg::Library | AppArg::Search) {
+        let want = if matches!(r, AppArg::Home | AppArg::Search | AppArg::Watchlist) || r.is_library_family() {
             Chrome::TabBar
         } else {
             Chrome::None
@@ -50,7 +50,7 @@ fn a_page_arg_wears_the_chrome_its_own_table_says() {
 /// route. It is graded against `route_word(r)` and not against `route_word(page_of(r))`
 /// because `page_of` is gone with the two routes that made it more than the identity: since
 /// phase 10 the profile and card menus are SURFACES, their words are the overlay alphabet's
-/// (`overlay_word`), and `every_route()` is nine pages with nothing to fold.
+/// (`overlay_word`), and `every_route()` is every page argument with nothing to fold.
 #[test]
 fn every_route_mounts_a_screen_that_names_the_heartbeat_word() {
     let _g = plx_base::testlock::serial();
@@ -173,6 +173,35 @@ fn switching_profile_leaves_the_container_holding_nothing_of_the_previous_profil
         !d.nav.tabs.stack.entries.iter().any(|e| e.arg.same_instance(&detail_arg("2002"))),
         "the parked push did not mint itself in behind the reset",
     );
+}
+
+/// **A profile switch dismisses an open Settings surface, at once.** The Playback page names the
+/// seated profile and lists that profile's own picks, so it must not survive the switch to the next
+/// one: it would say "for Maya" over Noah's values for as long as it stayed up. The surfaces go
+/// in `Navigator::reset_for_profile` (they are dropped first, then the page stack), which is
+/// called before the switch commits. Graded the moment `switch_profile` returns, before any frame
+/// runs: `Root(Profiles)` alone would sweep the surface a frame LATER (it retires the page the
+/// surface stands over), so only the reset itself can make this true immediately, and a frame in
+/// between would be a window in which the old profile's page is still drawn.
+///
+/// Not behind `hostsim`: nothing here needs the desktop simulator, so `make check` runs it.
+#[test]
+fn a_profile_switch_dismisses_an_open_settings_surface() {
+    let _g = plx_base::testlock::serial();
+    let mut d = Dispatcher::<AppHost>::new();
+    let mut rig = Bridge::for_test(|| 0);
+    frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
+    open_settings_at(&mut d, SettingsPage::Playback);
+    frame(&mut d, &mut rig, AppArg::Home, tick(1), vec![]);
+    assert!(settings_up(&d), "the Settings surface is up on the Playback page");
+    assert_eq!(overlay_word(&d), Some("playback"));
+
+    switch_profile(&mut d);
+    assert!(!settings_up(&d), "the switch dismissed Settings before any frame ran");
+
+    for i in 0..20u32 { frame(&mut d, &mut rig, AppArg::Profiles, tick(2 + i), vec![]); }
+    assert!(!settings_up(&d), "and it stays gone behind the picker");
+    assert!(d.nav.top_page().is_some_and(|e| e.arg == AppArg::Profiles));
 }
 
 /// **An app switch parks the tree; it does not tear the session's page history down.**
@@ -611,7 +640,7 @@ fn opening_the_item_menu_leaves_the_press_springing_and_the_opener_lift_follows_
     d.input.cancel_press(); // what the dispatcher does when it hears the hold answered
     assert!(d.input.press.is_active() && !d.input.press.is_live(), "abandoned and springing back");
     let dipped = d.input.press.scale();
-    assert_eq!(opener_press(&d).scale, dipped, "the lift draws the card at the press's own scale");
+    assert_eq!(d.opener_press().scale, dipped, "the lift draws the card at the press's own scale");
 
     open_item_menu(&mut d, card_menu_arg(&row, false, true, host, None, None));
     assert!(d.input.press.is_active(), "the menu opening does not end the spring-back");
@@ -624,11 +653,11 @@ fn opening_the_item_menu_leaves_the_press_springing_and_the_opener_lift_follows_
     for _ in 0..80 {
         ms += 16;
         d.input.press.tick(ms, 0.016);
-        assert_eq!(opener_press(&d).scale, d.input.press.scale(), "lift and page agree at {ms} ms");
-        // …and the context `redraw_opener` really draws with is built from that press: the scale
+        assert_eq!(d.opener_press().scale, d.input.press.scale(), "lift and page agree at {ms} ms");
+        // …and the context the dispatcher's lift pass really draws with is built from that press: the scale
         // the lift paints at is the press's own, and (while it moves) not the resting 1.0 a lift
         // that stopped reading the press would draw.
-        let lift = opener_parts(&d, host, None).press.scale;
+        let lift = d.opener_parts(host, None).press.scale;
         assert_eq!(lift, d.input.press.scale(), "the drawn lift scale is the press's at {ms} ms");
         if (d.input.press.scale() - 1.0).abs() > 0.01 { moving_frames += 1; assert_ne!(lift, 1.0, "…not the pop at {ms} ms"); }
         rose |= d.input.press.scale() > dipped + 0.05;
@@ -636,7 +665,7 @@ fn opening_the_item_menu_leaves_the_press_springing_and_the_opener_lift_follows_
     assert!(rose, "the spring really moved the card");
     assert!(moving_frames > 5, "the lift was checked mid-spring, not only at rest");
     assert!(!d.input.press.is_active());
-    assert_eq!(opener_press(&d).scale, 1.0, "at rest the lift is the resting pop");
+    assert_eq!(d.opener_press().scale, 1.0, "at rest the lift is the resting pop");
 }
 
 /// **A card hold the app takes: the release spring under the open item menu is the LIFT's, not
@@ -695,7 +724,7 @@ fn page_damage_frames_across_a_taken_holds_spring(lift_owns_the_card: bool) -> (
     // left the card out), then the spring.
     run(&mut d, &mut rig, &mut t);
     assert!(item_menu_up(&d), "the menu mounted");
-    assert_eq!(opener_lift(&d), Some((host, Some(key))));
+    assert_eq!(d.lifted_opener(), Some((host, Some(key))));
     plx_ui::popover::set_lift_owns(lift_owns_the_card);
     let (mut moving, mut damaged) = (0, 0);
     for _ in 0..40 {
@@ -1236,9 +1265,11 @@ fn search_route_steps_the_shared_strip_so_its_published_rects_do_not_go_stale() 
     // whose reveal target for its last entry sits well past the real strip's viewport, so
     // jumping straight to it (`StripRender::reveal`, a JUMP, not a step) leaves `rig.strip`'s
     // scroll spring far from where Search's own (short) labels want it.
-    let wide: Vec<String> = (0..8).map(|i| format!("Wide Destination Label Number {i}")).collect();
+    let wide: Vec<plx_ui::widgets::TabFace> = (0..8)
+        .map(|i| plx_ui::widgets::TabFace::Label(format!("Wide Destination Label Number {i}")))
+        .collect();
     rig.strip.reveal(
-        plx_ui::widgets::TabLabels { generation: 1, labels: &wide },
+        plx_ui::widgets::TabLabels { generation: 1, faces: &wide },
         wide.len() - 1,
     );
 
@@ -1301,7 +1332,7 @@ fn a_second_open_of_the_pending_detail_page_leaves_no_seed_behind() {
 /// its fade; a D-pad press in that window moves the page's focus to the neighbour, and a lift that
 /// kept repainting the menu's ORIGINAL key drew the old tile fully popped and captioned above the
 /// page — two tiles focused at once (Collection, owner's recording). The decision is
-/// [`opener_lift`], shared by every page.
+/// [`Dispatcher::lifted_opener`], shared by every page.
 #[test]
 fn a_closing_item_menus_opener_lift_stands_down_when_focus_moves_off_the_opener() {
     let _g = plx_base::testlock::serial();
@@ -1315,13 +1346,70 @@ fn a_closing_item_menus_opener_lift_stands_down_when_focus_moves_off_the_opener(
     let key = |elem| plx_machine::machine::FocusKey { entry: host, elem };
     open_item_menu(&mut d, card_menu_arg(&row, false, true, host, Some(key(7)), None));
     frame(&mut d, &mut rig, AppArg::Home, tick(1), vec![]);
-    assert_eq!(opener_lift(&d), Some((host, Some(key(7)))), "open: the lift paints the opener");
+    assert_eq!(d.lifted_opener(), Some((host, Some(key(7)))), "open: the lift paints the opener");
 
     let ev = script_key(Key::Back, tick(2));
     frame(&mut d, &mut rig, AppArg::Home, tick(2), ev);
     assert_eq!(d.nav.modals.top().map(|s| s.phase), Some(Phase::Closing));
     d.set_focus(Some(key(7)));
-    assert_eq!(opener_lift(&d), Some((host, Some(key(7)))), "closing, focus still on the opener: it stays lifted");
+    assert_eq!(d.lifted_opener(), Some((host, Some(key(7)))), "closing, focus still on the opener: it stays lifted");
     d.set_focus(Some(key(8)));
-    assert_eq!(opener_lift(&d), None, "closing, focus moved to the neighbour: the old tile is NOT repainted as focused");
+    assert_eq!(d.lifted_opener(), None, "closing, focus moved to the neighbour: the old tile is NOT repainted as focused");
+}
+
+/// **OK on a Continue Watching EPISODE opens the SHOW on the card's season** (Settings > Playback >
+/// Continue Watching = "Open details"): the decision `activate_deck_card` makes from the card, the
+/// shelf's `from_deck` and whether the press plays. The pure half pins every case that must NOT
+/// reroute — a discovery shelf's episode (its OK opens the episode's page), a press that plays
+/// (`DeckPress::Play` arrives as `want_play`), a movie, a show/season card, and an episode whose
+/// row names no show.
+#[test]
+fn a_deck_episode_press_opens_the_show_and_nothing_else_reroutes() {
+    use crate::app::input::deck_press_opens_show;
+    let card = |kind: i32, show_rk: &str| {
+        let mut m = plx_data::pms::PmsMovie::default();
+        m.rk = "ep".into();
+        m.kind = kind;
+        m.show_rk = show_rk.into();
+        m.season_index = 3;
+        m
+    };
+    let episode = card(3, "show");
+    assert!(deck_press_opens_show(&episode, true, false), "deck episode, OK opens details");
+    assert!(!deck_press_opens_show(&episode, false, false), "a discovery shelf's episode keeps its own page");
+    assert!(!deck_press_opens_show(&episode, true, true), "a press that plays plays");
+    assert!(!deck_press_opens_show(&card(3, ""), true, false), "no show row: today's episode page");
+    for kind in [0, 1, 2] {
+        assert!(!deck_press_opens_show(&card(kind, "show"), true, false), "kind {kind} is unchanged");
+    }
+}
+
+/// …and the other half: the page that is actually opened. A deck episode seeds the SHOW's detail
+/// page with the card's season; the same card from a discovery shelf seeds the episode's own page
+/// with no season (`open_detail` writes the seed in the call, before any frame spends it).
+#[test]
+fn activating_a_deck_episode_seeds_the_show_page_on_its_season_and_a_discovery_one_its_own() {
+    let _g = plx_base::testlock::serial();
+    let mut ps = plx_media::route::PlaybackSession::default();
+    let mt = unsafe { plx_base::task::MainThread::assume() };
+    let mut pa = plx_media::player::adapter::PlayerAdapter::new(mt);
+    let mut wait = None;
+    let mut episode = plx_data::pms::PmsMovie::default();
+    episode.sid = plx_plex::plex::ServerId::UNSET;
+    episode.rk = "ep-55".into();
+    episode.kind = 3;
+    episode.show_rk = "show-7".into();
+    episode.season_index = 3;
+
+    for (from_deck, rk, season) in [(true, "show-7", Some(3)), (false, "ep-55", None)] {
+        let mut d = Dispatcher::<AppHost>::new();
+        let mut rig = Bridge::for_test(|| 0);
+        frame(&mut d, &mut rig, AppArg::Home, tick(0), vec![]);
+        unsafe {
+            crate::app::input::activate_deck_card(&mut ps, &mut pa, &episode, from_deck, false, 0, None,
+                &mut d, &mut rig, &mut wait, 0);
+        }
+        let seed = rig.mounter.seed.as_ref().expect("a detail page was opened");
+        assert_eq!((seed.rk.as_str(), seed.spot.season), (rk, season), "from_deck {from_deck}");
+    }
 }

@@ -5,7 +5,9 @@ This page is about what to do when something doesn't work.
 
 ## The app tile does nothing
 
-PlxNative needs **webOS 4.0 or newer** (webOS 3.4.3 has also been tested and works). Older
+PlxNative needs **webOS 4.0 or newer** (webOS 3.4.3 has also been tested and works, and 3.9.3
+plays direct play from a source build at or after
+[`60f99c7`](https://github.com/GLinnik21/plx-native/commit/60f99c7)). Older
 firmware may not be able to start it at all, so the tile just does nothing when you select it. See [Will it work on my
 television?](../README.md#will-it-work-on-my-television) for the full picture, including sets
 that start but hit a specific known problem.
@@ -187,12 +189,14 @@ never needed to get help.
 ## AV1 and VP9 files don't play
 
 PlxNative direct plays AV1 only on a television whose own codec table lists an AV1 decoder, and
-8-bit VP9 (Profile 0) only on one whose table lists a VP9 decoder. On any other set, or for a 10-bit
-VP9 file, the server has to convert the item, which fails when your server can't transcode or
+VP9 only on one whose table lists a VP9 decoder, and 10-bit (Profile 2) VP9, HDR10 included, only on a
+webOS 4 television, the one family it has been measured on. On any other set, or for a 10-bit VP9 file
+on a newer webOS, the server has to convert the item, which fails when your server can't transcode or
 transcoding is switched off.
 
-AV1 and VP9 direct play are new. AV1 was built from LG's firmware and has not yet been watched playing on an
-AV1 set; VP9 has been played on a real set, but only 8-bit and 10-bit SDR files on one model. Both reach
+AV1 and VP9 direct play are new. An owner of an LG OLED A2 (webOS 10.3.1) reported AV1 playing, with no log
+to read it from; VP9 has been played on the dev set: 8-bit and 10-bit SDR files, and a PQ-tagged file whose HDR
+the television picked up (webOS 4 family only). That is a handful of models. Both reach
 people through the [nightly build](nightly-builds.md) first. If your TV
 decodes AV1 or VP9 and you want to try it:
 

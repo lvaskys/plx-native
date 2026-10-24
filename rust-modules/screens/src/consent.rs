@@ -364,10 +364,12 @@ impl ConsentPage {
 
     fn first_run_layout(title: &str, body: &str, has_crumb: bool, table: &TableView,
         labels: &[&std::ffi::CStr], measure: &dyn plx_machine::machine::Measure) -> RouteLayout {
-        let action_w = labels.iter().map(|label|
-            plx_ui::table_screen::pill_w(measure, label, theme::size::BODY)).sum::<f32>()
-            + plx_ui::widgets::CONTROL_GAP;
-        let action_w = action_w.ceil();
+        let pill = |label: &std::ffi::CStr| plx_ui::table_screen::pill_w(measure, label, theme::size::BODY);
+        // `labels` is always the two-action pair of a first-run consent (`Mode::FirstRun` above).
+        let &[lead, trail] = labels else {
+            unreachable!("a first-run consent has exactly two actions, got {}", labels.len())
+        };
+        let action_w = RouteLayout::action_pair_w(pill(lead), pill(trail)).ceil();
         let reader = DocumentReader::new().with_size(theme::size::BODY);
         RouteLayout::screen_for_reading(action_w, table.measured_width(measure), |layout| {
             let frame = layout.narrative_copy_frame(has_crumb, title, layout.action.y, measure);
@@ -1218,6 +1220,13 @@ pub fn preview_usage() -> String {
     for e in [
         DiagEvent::AppLaunch,
         DiagEvent::RouteEntered { screen: "home" },
+        DiagEvent::RouteLeft {
+            screen: "home",
+            slow_frames: "<1%",
+            frozen_frames: "0",
+            hang: "0",
+            dead_presses: "0",
+        },
         DiagEvent::SignInCompleted,
         DiagEvent::SignInStarted,
         DiagEvent::SignInFailed {
@@ -1357,6 +1366,7 @@ fn placeholder(token: &str) -> Option<&'static str> {
         "thread instruction address" => msg::settings_consent_placeholder_thread_address(),
         "thread id" => msg::settings_consent_placeholder_thread_id(),
         "internal thread label" => msg::settings_consent_placeholder_thread_label(),
+        "library file name" => msg::settings_consent_placeholder_library(),
         "webOS release" => msg::settings_consent_placeholder_webos_release(),
         "webOS release codename" => msg::settings_consent_placeholder_webos_codename(),
         "webOS API version" => msg::settings_consent_placeholder_webos_api(),
@@ -1373,6 +1383,7 @@ fn placeholder(token: &str) -> Option<&'static str> {
         "webOS codename" => msg::settings_consent_placeholder_webos_codename_short(),
         // Placeholders that list the field's possible wire values: the codes are the payload.
         "ok / missing / n/a" => "ok / missing / n/a",
+        "ok / no_keys / unreadable / unprobed per nyx file" => "ok / no_keys / unreadable / unprobed per nyx file",
         "devmode / homebrew / unknown" => "devmode / homebrew / unknown",
         "local / remote / relay / unknown" => "local / remote / relay / unknown",
         "v4 / v6 / unknown" => "v4 / v6 / unknown",

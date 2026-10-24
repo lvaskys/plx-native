@@ -2,6 +2,7 @@
 //! worker-result addressing and directory-discovery landing order.
 
 use super::*;
+use plx_ui::screen::DrawFrame;
 #[allow(unused_imports)]
 use super::test_support::*;
 use super::test_support::{frame, frame_with_tap, frame_with_results};
@@ -273,12 +274,23 @@ fn home_return_restores_the_offscreen_item_and_viewport_after_retention_or_evict
         let instance = d.nav.instance_of(home).unwrap();
         d.emit(MachineId::Nav, Fx::Deliver(MachineId::Instance(instance),
             Delivery::Screen(ScreenEvent::App(AppMsg::Home(HomeCmd::FocusGrid { row: 4, col: 18 })))));
-        for i in 1..80 { frame(&mut d, &mut rig, AppArg::Home, tick(i), vec![]); }
+        // Home holds cards for the rows around the user and gives the rest up; this fixture has no
+        // server, so the rows that come back into the ring are answered here, each frame, as a
+        // server answers them. Nothing answers after the user leaves: what the return shows on its
+        // first frame is what Home still held.
+        for i in 1..80 {
+            rig.stores.hubs.land_kept_rows_for_test();
+            frame(&mut d, &mut rig, AppArg::Home, tick(i), vec![]);
+        }
         for i in 80..84 { frame(&mut d, &mut rig, AppArg::Home, tick(i), script_key(Key::Left, tick(i))); }
-        for i in 84..160 { frame(&mut d, &mut rig, AppArg::Home, tick(i), vec![]); }
+        for i in 84..160 {
+            rig.stores.hubs.land_kept_rows_for_test();
+            frame(&mut d, &mut rig, AppArg::Home, tick(i), vec![]);
+        }
         let focus = d.focus().unwrap();
         let before = rig.with_home(&d, |s, cx, f| {
             assert_eq!(s.grid_position::<AppHost>(f, cx), Some((4, 14)));
+            assert!(!s.focused_item::<AppHost>(f, cx).unwrap().rk.is_empty(), "the card left must be a landed card");
             s.focused_rect::<AppHost>(f, cx, At::Drawn).unwrap()
         }).unwrap();
         let count = if evict { plx_ui::containers::stack::CAP + 1 } else { 1 };
@@ -386,7 +398,7 @@ fn library_publishes_the_actual_container_strip() {
     bridge.capture_chrome(&mut dispatcher);
     let base = plx_ui::dispatch::STRIP_BASE;
     assert_eq!(dispatcher.nav.tabs.strip.iter().map(|member| member.elem).collect::<Vec<_>>(),
-        vec![base + 4, base, base + 1, base + 2, base + 3]);
+        vec![base + 4, base, base + 1, base + 2, plx_ui::widgets::TAB_KEY_WATCHLIST, base + 3]);
     assert_eq!(dispatcher.nav.tabs.strip_fallback, Some(base));
 }
 
