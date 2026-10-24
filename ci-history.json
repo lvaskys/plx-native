@@ -1,0 +1,9 @@
+{"updated":"2026-10-24T01:54:00Z",
+"ci":[
+{"id":40051264512,"at":"2026-10-24T01:45:57Z","sha":"263076a34","title":"Server updates: a library change refreshes Home, the shelves and the library grids","pr":959,"conclusion":"success","attempt":1,"jobs":{"which gates apply":6,"host python/shell/C gates":194,"host harness tests":191,"host unit tests (default features)":459,"host unit tests (hostsim)":329,"armv7 cross-build and artifact assertions":435,"host lint + type-checks":165,"cross-build (armv7) + artifact assertions":3,"host checks (NOT a device gate)":3}}
+],
+"sim":[],
+"nightly":[],
+"cancelled":{},
+"daily":[],
+"flaky":[]}
