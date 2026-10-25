@@ -204,6 +204,20 @@ fn app_seek_repeats_in_one_epoch_and_only_current_source_eof_reopens_eos() {
 }
 
 #[test]
+fn app_seek_preserves_a_validated_local_video_composition_offset() {
+    let _g=plx_base::testlock::serial();let mut pa=fresh();running_app_source(&mut pa,1);
+    let ticket=begin_app_source_seek(&mut pa,1,2).unwrap();
+    assert_eq!(commit_app_source_seek_at(&mut pa,ticket,20_000_000_000,500_000_001),Err(AppSourceSeekError::Invalid));
+    commit_app_source_seek_at(&mut pa,ticket,20_000_000_000,83_416_000).unwrap();
+    let count=Rc::new(Cell::new(0));assert_eq!(enqueue(&mut pa,2,1,0,&count).1,AppEnqueue::Invalid);
+    let (p,status)=enqueue(&mut pa,2,1,83_416_000,&count);assert_eq!(status,AppEnqueue::Accepted);
+    ffi_host::owned_feed_script_for_test(vec![b'B',b'O']);pump_app_source(&mut pa,super::super::vclock_ms());
+    pump_app_source(&mut pa,super::super::vclock_ms());assert_eq!(ffi_host::seek_log_for_test(),vec![83]);
+    let feeds=ffi_host::take_owned_feeds_for_test();assert_eq!(&feeds[feeds.len()-2..],&[(p as usize,5,83_416_000,1),(p as usize,5,83_416_000,1)]);
+    assert!(stop_app_source(&mut pa,2));ffi_host::force_clocksink_for_test(false);
+}
+
+#[test]
 fn app_seek_pause_refusal_fatal_error_and_stop_preserve_real_ownership() {
     let _g=plx_base::testlock::serial();let mut pa=fresh();let epoch=running_app_source(&mut pa,1);
     let count=Rc::new(Cell::new(0));enqueue(&mut pa,1,1,2_000_000_000,&count);

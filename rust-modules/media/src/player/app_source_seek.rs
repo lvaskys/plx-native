@@ -71,6 +71,7 @@ pub fn begin_app_source_seek(
         ticket,
         phase: AppSeekPhase::Preparing,
         first_video: true,
+        first_video_pts_ns: 0,
     });
     if hold_native_clock_for_seek(mt) != Some(crate::player::shared::HlsPauseCompletion::Accepted)
         || !SHARED.begin_native_media_discontinuity(ticket.epoch)
@@ -111,6 +112,22 @@ pub fn commit_app_source_seek(
     ticket: AppSourceSeekTicket,
     duration_ns: i64,
 ) -> Result<(), AppSourceSeekError> {
+    commit_app_source_seek_at(pa, ticket, duration_ns, 0)
+}
+
+/// Preserve a validated local video composition offset (for example 83ms after
+/// window decode origin). The embedding maps this through the existing CDM
+/// microsecond conversion; no opaque timestamp is rewritten. Native Seek uses
+/// the same first keyframe PTS through the shared Feed path.
+pub fn commit_app_source_seek_at(
+    pa: &mut PlayerAdapter,
+    ticket: AppSourceSeekTicket,
+    duration_ns: i64,
+    first_video_pts_ns: i64,
+) -> Result<(), AppSourceSeekError> {
+    if !(0..=500_000_000).contains(&first_video_pts_ns) || first_video_pts_ns >= duration_ns {
+        return Err(AppSourceSeekError::Invalid);
+    }
     if !(1..=3_600_000_000_000).contains(&duration_ns) {
         return Err(AppSourceSeekError::Invalid);
     }
@@ -137,9 +154,10 @@ pub fn commit_app_source_seek(
         generation: ticket.next,
     };
     eng.app_seek.as_mut().unwrap().phase = AppSeekPhase::Feeding;
+    eng.app_seek.as_mut().unwrap().first_video_pts_ns = first_video_pts_ns;
     SHARED.duration_ns.store(duration_ns, Ordering::Relaxed);
     SHARED.ended.store(false, Ordering::Release);
-    SHARED.seek_target_ns.store(0, Ordering::Relaxed);
+    SHARED.seek_target_ns.store(first_video_pts_ns, Ordering::Relaxed);
     SHARED.disp_base.store(0, Ordering::Relaxed);
     SHARED.hls_video_tail_ns.store(-1, Ordering::Relaxed);
     SHARED.hls_audio_tail_ns.store(-1, Ordering::Relaxed);

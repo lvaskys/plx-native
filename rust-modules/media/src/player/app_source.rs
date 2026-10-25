@@ -23,7 +23,7 @@ pub enum AppSourceStatus { Idle, Loading, Buffering, Playing, Ended, Failed, Pau
 
 #[path = "app_source_seek.rs"]
 mod seek;
-pub use seek::{begin_app_source_seek,commit_app_source_seek,abort_app_source_seek,app_source_seek_status};
+pub use seek::{begin_app_source_seek,commit_app_source_seek,commit_app_source_seek_at,abort_app_source_seek,app_source_seek_status};
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct AppSourceSeekTicket { epoch:u32, previous:u64, next:u64, paused:bool }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -32,7 +32,7 @@ pub enum AppSourceSeekError { Invalid, NotReady, ReloadRequired }
 pub enum AppSourceSeekStatus { Preparing, Priming, Ready, ReloadRequired, Failed, Stale }
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum AppSeekPhase { Preparing, Feeding, ReloadRequired }
-pub(super) struct AppSeekTransaction { ticket:AppSourceSeekTicket, phase:AppSeekPhase, first_video:bool }
+pub(super) struct AppSeekTransaction { ticket:AppSourceSeekTicket, phase:AppSeekPhase, first_video:bool, first_video_pts_ns:i64 }
 
 static APP_STARTED: AtomicU32 = AtomicU32::new(0);
 static APP_FIRST_PICTURE: AtomicI64 = AtomicI64::new(-1);
@@ -166,7 +166,12 @@ pub fn start_app_source(pa: &mut super::super::adapter::PlayerAdapter, start: Ap
     let clock = ClockStartGuard::arm().ok_or(AppSourceError::NativeBusy)?;
     let native = NativeSessionStartGuard::arm().ok_or(AppSourceError::NativeBusy)?;
     let epoch = native.epoch();
+    let fresh_play=pa.first_app_generation();
     if !pa.admit_app_generation(start.generation) { return Err(AppSourceError::Invalid); }
+    // A fresh adapter's first admitted app source begins a new playback. The
+    // native start guard above proves no older pipeline is live. Reloads on
+    // this adapter preserve refusal; embeddings also retain their per-Play latch.
+    if fresh_play { super::super::set_native_seek_refused(false); }
     APP_STARTED.store(super::super::vclock_ms(),Ordering::Release);
     APP_FIRST_PICTURE.store(-1,Ordering::Release); APP_LOAD_COMPLETED.store(-1,Ordering::Release);
     APP_AUDIO_INFO.store(0,Ordering::Release); APP_SVP.store(0,Ordering::Release);
@@ -244,7 +249,7 @@ pub unsafe fn app_source_enqueue(pa: &mut super::super::adapter::PlayerAdapter,
     if !(1..=2).contains(&lane) || !(1..=1024*1024).contains(&len)
         || pts_ns < 0 || SHARED.demux_io_failed.load(Ordering::Acquire)
         || SHARED.load_failed.load(Ordering::Acquire) { return AppEnqueue::Invalid; }
-    if lane==1&&eng.app_seek.as_ref().is_some_and(|s|s.first_video)&&(key==0||pts_ns!=0){return AppEnqueue::Invalid;}
+    if lane==1&&eng.app_seek.as_ref().is_some_and(|s|s.first_video&&(key==0||pts_ns!=s.first_video_pts_ns)){return AppEnqueue::Invalid;}
     let q = if lane == 1 { &mut eng.aq_video } else { &mut eng.aq_audio };
     let Some(q) = q.as_mut() else { return AppEnqueue::Invalid; };
     let result=match crate::aq::aq_try_push_owned(&mut **q, data, len, pts_ns, key, lane, owner, release) {

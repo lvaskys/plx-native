@@ -68,6 +68,7 @@ impl PlayerAdapter {
         self.app_generation = generation;
         true
     }
+    pub(super) fn first_app_generation(&self) -> bool { self.app_generation == 0 }
 
     /// Park a real stop's off-frame release. At most one exists: the next start finishes it
     /// before it can construct another object.

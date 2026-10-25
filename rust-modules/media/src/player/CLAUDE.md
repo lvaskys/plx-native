@@ -71,8 +71,10 @@ The explicit `begin_app_source_seek` / commit / abort API retains a ready native
 Engine while replacing its app-owned queue generation. Begin requires the
 embedding producer to be stopped; it holds the shared seek clock, fences media
 callbacks and drains pending/queued owners on the main thread. Commit requires
-window-local timestamps: the first video AU must be a keyframe at zero. The
-shared Feed path calls public Seek(0) once, retains the exact owner on BufferFull
+window-local timestamps: the first video AU must match the committed keyframe
+offset (zero by default, or a validated composition offset up to 500ms through
+`commit_app_source_seek_at`). The shared Feed path calls public Seek at that
+unaltered PTS once, retains the exact owner on BufferFull
 and primes both lanes. Paused windows feed only after Resume. EOS stays fenced
 until the new source actually submits EOS. Failed/refused handoffs require real
 Stop/reload; the reserved generation is burned. Tickets bind the native epoch
