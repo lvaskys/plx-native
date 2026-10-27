@@ -62,7 +62,10 @@ running clock (the parent's failed 0.2.4 device run observed that distinction).
 `set_app_source_paused` / `app_source_paused` scope viewer transport intent to
 the live app generation. They reuse `player::pause` / `resume` and the existing
 clock actuator: refused Pause does not change intent, paused pumps retain queue
-owners without Feed, and Resume opens feeding before balanced prime issues Play.
+owners without Feed after presentation settles, and Resume opens feeding before
+balanced prime issues Play. A paused app source awaiting its first picture uses
+the same muted one-frame preroll and accepted re-pause as the route pump; it
+reports Buffering during that work while `app_source_paused` remains true.
 Logical Pause/Resume during an initial held Load cannot overtake that worker.
 `AppSourceStatus::Paused` reports accepted intent, not a physical-presentation
 measurement. These entries own no provider refresh, source seek or UI state.
@@ -75,7 +78,9 @@ window-local timestamps: the first video AU must match the committed keyframe
 offset (zero by default, or a validated composition offset up to 500ms through
 `commit_app_source_seek_at`). The shared Feed path calls public Seek at that
 unaltered PTS once, retains the exact owner on BufferFull
-and primes both lanes. Paused windows feed only after Resume. EOS stays fenced
+and primes both lanes. Paused windows prime a muted target frame and re-pause
+through the shared `settle_paused_seek`; status becomes Ready only after the
+preroll closes. EOS stays fenced
 until the new source actually submits EOS. Failed/refused handoffs require real
 Stop/reload; the reserved generation is burned. Tickets bind the native epoch
 and both generations. The external source/UI still owns episode-origin mapping,

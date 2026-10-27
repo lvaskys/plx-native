@@ -43,6 +43,7 @@ pub fn begin_app_source_seek(
         .is_some_and(|s| s.phase != AppSeekPhase::Feeding)
         || eng.stage < Stage::Playing
         || eng.prime_play
+        || TX.seek_preroll_active()
         || eng.rebase_pending
         || !SHARED.native_load_returned(eng.native_epoch)
         || !SHARED.load_completed.load(Ordering::Acquire)
@@ -79,8 +80,8 @@ pub fn begin_app_source_seek(
         eng.app_seek.as_mut().unwrap().phase = AppSeekPhase::ReloadRequired;
         return Err(AppSourceSeekError::ReloadRequired);
     }
-    // App windows wait for explicit Resume, unlike Plex's one-frame paused
-    // seek preroll. Restore the orthogonal user hold on the shared seek clock.
+    // Preserve the orthogonal viewer hold. Once committed, the shared paused
+    // seek preroll borrows it to present a muted frame and then re-pauses.
     if ticket.paused
         && !matches!(
             SHARED.prepare_hls_user_pause(),
@@ -215,6 +216,7 @@ pub fn app_source_seek_status(
             if eng.flushed && crate::player::native_seek_refused() {
                 AppSourceSeekStatus::ReloadRequired
             } else if eng.prime_play
+                || TX.seek_preroll_active()
                 || eng.rebase_pending
                 || SHARED.frames.load(Ordering::Acquire) == 0
             {

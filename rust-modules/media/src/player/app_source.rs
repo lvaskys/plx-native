@@ -274,6 +274,16 @@ pub fn pump_app_source(pa: &mut super::super::adapter::PlayerAdapter, now: u32) 
     // Stop can leave Load in flight. Keep reaping its return on the main thread,
     // even when there is no live Engine and the caller is showing its catalog.
     reap_abandoned_load(pa);
+    // Reuse the route pump's muted one-frame preroll, including its accepted
+    // re-pause and volume restore. It must not overtake Load or an uncommitted
+    // app queue handoff; provider/route effects remain outside this pump.
+    if !SHARED.load_failed.load(Ordering::Acquire)
+        && !SHARED.demux_io_failed.load(Ordering::Acquire)
+        && pa.engine().is_some_and(|eng| matches!(eng.source,Source::AppOwned { .. })
+            && eng.stage >= Stage::Playing
+            && eng.app_seek.as_ref().is_none_or(|s|s.phase==AppSeekPhase::Feeding)) {
+        super::super::pump::settle_paused_seek(pa,now);
+    }
     let (eng,mt) = pa.split();
     let Some(eng) = eng else { return AppSourceStatus::Idle; };
     if !matches!(eng.source, Source::AppOwned { .. }) { return AppSourceStatus::Idle; }
@@ -295,9 +305,9 @@ pub fn pump_app_source(pa: &mut super::super::adapter::PlayerAdapter, now: u32) 
     // The app needs actual EOS before accepting its bounded hardware control.
     if eng.eos_pushed && SHARED.ended.load(Ordering::Acquire) {
         AppSourceStatus::Ended
-    } else if TX.paused.load(Ordering::Acquire) {
+    } else if TX.paused.load(Ordering::Acquire) && !TX.seek_preroll_active() {
         AppSourceStatus::Paused
-    } else if eng.prime_play || SHARED.frames.load(Ordering::Relaxed) == 0 {
+    } else if eng.prime_play || TX.seek_preroll_active() || SHARED.frames.load(Ordering::Relaxed) == 0 {
         AppSourceStatus::Buffering
     } else { AppSourceStatus::Playing }
 }

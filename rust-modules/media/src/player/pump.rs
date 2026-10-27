@@ -1110,7 +1110,7 @@ static MID_SEEK_CLAIMS: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 /// `playpos + 15 s >= target` is the guard the loop's old re-pause had: a presented frame far
 /// before the target is not the landing. Runs before `pa` is split, because the re-pause takes the
 /// whole adapter.
-fn settle_paused_seek(pa: &mut super::adapter::PlayerAdapter, now: u32) {
+pub(super) fn settle_paused_seek(pa: &mut super::adapter::PlayerAdapter, now: u32) {
     if TX.paused.load(Acquire)
         && !TX.seek_preroll_active()
         && SHARED.seeking.load(Relaxed)

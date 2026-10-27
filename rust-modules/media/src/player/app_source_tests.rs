@@ -132,15 +132,21 @@ fn app_seek_fences_pending_and_queued_owners_then_reuses_the_native_segment_at_z
 }
 
 #[test]
-fn app_seek_pause_abort_and_native_refusal_require_explicit_reload_cleanup() {
-    let _g=plx_base::testlock::serial();let mut pa=fresh();running_app_source(&mut pa,1);
+fn app_seek_paused_frame_then_abort_and_native_refusal_require_explicit_reload_cleanup() {
+    let _g=plx_base::testlock::serial();let mut pa=fresh();let epoch=running_app_source(&mut pa,1);
     assert!(set_app_source_paused(&mut pa,1,true));let plays=ffi_host::play_calls_for_test();
     let ticket=begin_app_source_seek(&mut pa,1,2).unwrap();assert_eq!(commit_app_source_seek(&mut pa,ticket,15_000_000_000),Ok(()));
     let count=Rc::new(Cell::new(0));enqueue(&mut pa,2,1,0,&count);enqueue(&mut pa,2,1,700_000_000,&count);enqueue(&mut pa,2,2,400_000_000,&count);
-    for _ in 0..3 {assert_eq!(pump_app_source(&mut pa,super::super::vclock_ms()),AppSourceStatus::Paused);}
-    assert_eq!(count.get(),0);assert!(ffi_host::seek_log_for_test().is_empty());assert_eq!(ffi_host::play_calls_for_test(),plays);
+    for _ in 0..3 {assert_eq!(pump_app_source(&mut pa,super::super::vclock_ms()),AppSourceStatus::Buffering);}
+    assert_eq!(count.get(),3);assert_eq!(ffi_host::seek_log_for_test(),vec![0]);assert_eq!(ffi_host::play_calls_for_test(),plays+1);
+    assert_eq!(app_source_paused(&mut pa,2),Some(true));assert_eq!(ffi_host::host_volume_for_test(),0);
+    app_source_native_event(epoch,0,83_000_000);
+    assert_eq!(pump_app_source(&mut pa,super::super::vclock_ms()),AppSourceStatus::Paused);
+    assert_eq!(app_source_seek_status(&mut pa,ticket),AppSourceSeekStatus::Ready);
+    assert_eq!(ffi_host::host_volume_for_test(),plx_platform::tv::sink::PIPELINE_DEFAULT_VOLUME);
+    enqueue(&mut pa,2,1,1_400_000_000,&count);enqueue(&mut pa,2,2,1_100_000_000,&count);
     assert!(set_app_source_paused(&mut pa,2,false));pump_app_source(&mut pa,super::super::vclock_ms());
-    assert_eq!(ffi_host::seek_log_for_test(),vec![0]);assert_eq!(count.get(),3);assert_eq!(ffi_host::play_calls_for_test(),plays+1);
+    assert_eq!(ffi_host::seek_log_for_test(),vec![0]);assert_eq!(count.get(),5);assert_eq!(ffi_host::play_calls_for_test(),plays+2);
     assert!(stop_app_source(&mut pa,2));
     let mut pa=fresh();running_app_source(&mut pa,4);let ticket=begin_app_source_seek(&mut pa,4,5).unwrap();
     assert!(abort_app_source_seek(&mut pa,ticket));assert_eq!(app_source_seek_status(&mut pa,ticket),AppSourceSeekStatus::ReloadRequired);
